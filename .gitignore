@@ -127,3 +127,5 @@ core.*
 
 #github
 /.github/
+firebase-applet-config.json
+/server/firebase-applet-config.json
