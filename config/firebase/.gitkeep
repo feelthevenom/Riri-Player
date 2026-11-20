@@ -1,0 +1,1 @@
+# Keeps /config/firebase/ tracked in public repositories while real config files are gitignored.
