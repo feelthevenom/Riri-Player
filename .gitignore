@@ -132,8 +132,7 @@ builder-effective-config.yaml
 #node_module
 /node_modules
 
-#github
-/.github/
+# GitHub Actions are versioned so release automation stays reproducible.
 
 # IDE/Editor
 .vscode/

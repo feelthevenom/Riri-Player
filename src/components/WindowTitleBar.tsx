@@ -80,7 +80,7 @@ export const WindowTitleBar: React.FC<WindowTitleBarProps> = ({
         releaseData = await response.json();
       }
       
-      const currentVersion = '1.0.0'; // From package.json
+      const currentVersion = '1.1.0'; // From package.json
       if (releaseData) {
         setChangelogData({
           version: releaseData.tag_name?.replace('v', '') || 'Unknown',

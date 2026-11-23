@@ -9,24 +9,73 @@ const {
   session,
   safeStorage,
   dialog,
+  shell,
 } = require('electron');
 const crypto = require('node:crypto');
 const path = require('node:path');
 const fs = require('node:fs');
+const {
+  UPDATE_REPOSITORY,
+  createUpdateInfoFromRelease,
+  fetchLatestGitHubRelease,
+  getPublicErrorMessage,
+  getUpdateAvailability,
+  isMissingUpdateMetadataError,
+} = require('./update-utils.cjs');
 
 // Auto-updater setup
 let autoUpdater = null;
-if (app.isPackaged) {
+let updateCheckInProgress = false;
+
+// Initialize electron-log first for proper logging
+let log = null;
+try {
+  log = require('electron-log');
+  // Set log file path explicitly - works for both installed and portable
+  const logPath = path.join(app.getPath('userData'), 'logs', 'main.log');
+  // Ensure log directory exists
+  const logDir = path.dirname(logPath);
+  if (!fs.existsSync(logDir)) {
+    fs.mkdirSync(logDir, { recursive: true });
+  }
+  log.transports.file.resolvePath = () => logPath;
+  log.transports.file.level = 'info';
+  log.transports.console.level = 'info';
+  // Don't use preload - initialize manually
+  Object.assign(console, log.functions);
+  console.log('[AutoUpdater] electron-log initialized, log path:', logPath);
+} catch (err) {
+  console.warn('[AutoUpdater] Failed to initialize electron-log:', err?.message || err);
+}
+
+// Try to initialize auto-updater for both installed and portable builds
+// app.isPackaged should be true for both NSIS and portable builds from electron-builder
+const isProduction = app.isPackaged || process.env.NODE_ENV === 'production';
+console.log('[AutoUpdater] isProduction:', isProduction, 'app.isPackaged:', app.isPackaged, 'NODE_ENV:', process.env.NODE_ENV);
+if (isProduction) {
   try {
+    console.log('[AutoUpdater] Attempting to load electron-updater...');
     const { autoUpdater: au } = require('electron-updater');
     autoUpdater = au;
-    autoUpdater.logger = require('electron-log');
-    autoUpdater.logger.transports.file.level = 'info';
+    if (log) autoUpdater.logger = log;
     autoUpdater.autoDownload = false; // Respect user setting
     autoUpdater.autoInstallOnAppQuit = true;
+    // Configure GitHub update server explicitly
+    autoUpdater.setFeedURL({
+      provider: 'github',
+      owner: UPDATE_REPOSITORY.owner,
+      repo: UPDATE_REPOSITORY.repo,
+    });
+    console.log('[AutoUpdater] Initialized for GitHub releases');
+    console.log('[AutoUpdater] Feed URL:', autoUpdater.feedURL);
+    console.log('[AutoUpdater] App path:', app.getPath('exe'));
+    console.log('[AutoUpdater] UserData path:', app.getPath('userData'));
   } catch (err) {
     console.warn('[AutoUpdater] Failed to load electron-updater:', err?.message || err);
+    console.warn('[AutoUpdater] Stack:', err?.stack);
   }
+} else {
+  console.log('[AutoUpdater] Not initialized (development mode)');
 }
 
 // Must be called before app.whenReady():
@@ -397,14 +446,112 @@ app.whenReady().then(async () => {
 
   // Auto-updater IPC handlers
   ipcMain.handle('ririplayer:check-for-updates', async () => {
+    const currentVersion = app.getVersion();
+    console.log('[AutoUpdater] check-for-updates called, autoUpdater:', autoUpdater ? 'exists' : 'null');
+    console.log('[AutoUpdater] current version:', currentVersion);
+    console.log('[AutoUpdater] app.isPackaged:', app.isPackaged);
+    console.log('[AutoUpdater] userData path:', app.getPath('userData'));
+    console.log('[AutoUpdater] exe path:', app.getPath('exe'));
     if (!autoUpdater) {
-      return { ok: false, error: 'Auto-updater not available (dev mode)' };
+      return { ok: false, error: 'Auto-updater not available (not initialized)', currentVersion };
     }
+
+    updateCheckInProgress = true;
     try {
       const result = await autoUpdater.checkForUpdates();
-      return { ok: true, updateInfo: result?.updateInfo || null };
+      console.log('[AutoUpdater] checkForUpdates result:', result);
+      if (!result) {
+        return { ok: false, error: 'Update check returned no result', currentVersion };
+      }
+
+      const updateInfo = result.updateInfo || null;
+      // electron-updater always returns `updateInfo` (latest server version),
+      // but `isUpdateAvailable` is the authoritative flag for whether it is newer
+      // than the installed app version.
+      return {
+        ok: true,
+        updateInfo,
+        isUpdateAvailable: Boolean(result.isUpdateAvailable),
+        currentVersion,
+        source: 'electron-updater',
+      };
     } catch (err) {
-      return { ok: false, error: err?.message || 'Update check failed' };
+      console.error('[AutoUpdater] checkForUpdates error:', err);
+
+      // A GitHub release may exist without the electron-builder update manifest.
+      // In that case electron-updater cannot install anything, but the release
+      // tag is still enough to determine whether the user is already current.
+      if (isMissingUpdateMetadataError(err)) {
+        try {
+          const release = await fetchLatestGitHubRelease({
+            owner: UPDATE_REPOSITORY.owner,
+            repo: UPDATE_REPOSITORY.repo,
+            appVersion: currentVersion,
+            fetchImpl: session.defaultSession.fetch.bind(session.defaultSession),
+          });
+          const availability = getUpdateAvailability(release.version, currentVersion);
+          console.log(
+            `[AutoUpdater] Missing latest.yml; GitHub release v${release.version}, current v${currentVersion}, comparison: ${availability.comparison}`,
+          );
+
+          if (!availability.isUpdateAvailable) {
+            return {
+              ok: true,
+              updateInfo: createUpdateInfoFromRelease(release),
+              isUpdateAvailable: false,
+              currentVersion,
+              source: 'github-release-fallback',
+            };
+          }
+
+          const metadataError =
+            `Update v${release.version} is available, but automatic installation is unavailable because the release is missing latest.yml. ` +
+            'Download and install it manually from the GitHub release page.';
+          console.error(`[AutoUpdater] ${metadataError}`);
+          return {
+            ok: false,
+            error: metadataError,
+            currentVersion,
+            latestVersion: release.version,
+            metadataMissing: true,
+            releaseUrl: release.htmlUrl,
+            source: 'github-release-fallback',
+          };
+        } catch (fallbackError) {
+          console.error('[AutoUpdater] GitHub release fallback failed:', fallbackError);
+          return {
+            ok: false,
+            error:
+              'Could not verify the latest GitHub release because the update metadata is missing. ' +
+              getPublicErrorMessage(fallbackError, 'GitHub release check failed.'),
+            currentVersion,
+            metadataMissing: true,
+            source: 'github-release-fallback',
+          };
+        }
+      }
+
+      return {
+        ok: false,
+        error: getPublicErrorMessage(err, 'Update check failed'),
+        currentVersion,
+      };
+    } finally {
+      updateCheckInProgress = false;
+    }
+  });
+
+  ipcMain.handle('ririplayer:open-release-page', async (_event, releaseUrl) => {
+    try {
+      const parsedUrl = new URL(releaseUrl);
+      if (parsedUrl.protocol !== 'https:' || parsedUrl.hostname !== 'github.com') {
+        return { ok: false, error: 'Invalid GitHub release URL' };
+      }
+      await shell.openExternal(parsedUrl.toString());
+      return { ok: true };
+    } catch (err) {
+      console.error('[AutoUpdater] Failed to open GitHub release page:', err);
+      return { ok: false, error: err?.message || 'Failed to open the GitHub release page' };
     }
   });
 
@@ -445,7 +592,17 @@ app.whenReady().then(async () => {
       mainWindow?.webContents.send('ririplayer:update-status', { status: 'not-available' });
     });
     autoUpdater.on('error', (err) => {
-      mainWindow?.webContents.send('ririplayer:update-status', { status: 'error', error: err?.message });
+      // The IPC handler resolves missing latest.yml errors through the GitHub
+      // release-version fallback. Do not show a transient error toast before
+      // that fallback can return the correct up-to-date result.
+      if (updateCheckInProgress && isMissingUpdateMetadataError(err)) {
+        console.warn('[AutoUpdater] Release metadata is missing; using GitHub release version fallback.');
+        return;
+      }
+      mainWindow?.webContents.send('ririplayer:update-status', {
+        status: 'error',
+        error: getPublicErrorMessage(err, 'Update check failed'),
+      });
     });
     autoUpdater.on('download-progress', (progress) => {
       mainWindow?.webContents.send('ririplayer:update-progress', progress);

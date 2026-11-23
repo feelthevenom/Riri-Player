@@ -40,6 +40,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Auto-updater
   checkForUpdates: () => ipcRenderer.invoke('ririplayer:check-for-updates'),
+  openReleasePage: (releaseUrl) => ipcRenderer.invoke('ririplayer:open-release-page', releaseUrl),
   downloadUpdate: () => ipcRenderer.invoke('ririplayer:download-update'),
   installUpdate: () => ipcRenderer.invoke('ririplayer:install-update'),
   getUpdateSettings: () => ipcRenderer.invoke('ririplayer:get-update-settings'),

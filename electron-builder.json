@@ -9,7 +9,19 @@
     "dist/**/*",
     "electron/**/*",
     "public/icon.png",
-    "package.json"
+    "package.json",
+    "node_modules/electron-updater/**/*",
+    "node_modules/electron-log/**/*"
+  ],
+  "extraResources": [
+    {
+      "from": "node_modules/electron-updater",
+      "to": "node_modules/electron-updater"
+    },
+    {
+      "from": "node_modules/electron-log",
+      "to": "node_modules/electron-log"
+    }
   ],
   "win": {
     "icon": "public/icon.png",
@@ -32,10 +44,10 @@
     "createDesktopShortcut": true,
     "createStartMenuShortcut": true,
     "deleteAppDataOnUninstall": false,
-    "artifactName": "${productName}-Setup-${version}-win-${arch}.${ext}"
+    "artifactName": "Riri.Player-Setup-${version}-win-${arch}.${ext}"
   },
   "portable": {
-    "artifactName": "${productName}-Portable-${version}-win-${arch}.${ext}"
+    "artifactName": "Riri.Player-Portable-${version}-win-${arch}.${ext}"
   },
   "publish": {
     "provider": "github",

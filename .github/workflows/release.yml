@@ -1,0 +1,115 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build and Release
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify tag matches application version
+        id: version
+        shell: bash
+        run: |
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$PACKAGE_VERSION" != "$TAG_VERSION" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $PACKAGE_VERSION"
+            exit 1
+          fi
+          echo "version=$PACKAGE_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build Windows distributables
+        run: npm run dist:win
+
+      - name: Validate update metadata and release assets
+        shell: bash
+        run: node scripts/verify-release-metadata.cjs
+
+      - name: Generate changelog
+        id: changelog
+        shell: bash
+        run: |
+          PREV_TAG="$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)"
+          CURRENT_TAG="${GITHUB_REF_NAME}"
+          CHANGELOG=""
+          if [ -n "$PREV_TAG" ]; then
+            CHANGELOG="$(git log "$PREV_TAG..$CURRENT_TAG" --pretty=format:"- %s (%an)" --reverse)"
+          else
+            CHANGELOG="$(git log "$CURRENT_TAG" --pretty=format:"- %s (%an)" --reverse)"
+          fi
+          CHANGELOG_ESCAPED="$(printf '%s' "$CHANGELOG" | sed ':a;N;s/\n/\\n/g;ta' | sed 's/"/\\"/g')"
+          echo "previous_tag=$PREV_TAG" >> "$GITHUB_OUTPUT"
+          echo "changelog=$CHANGELOG_ESCAPED" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Riri Player ${{ github.ref_name }}
+          body: |
+            ## Changes in ${{ github.ref_name }}
+
+            ${{ steps.changelog.outputs.changelog }}
+
+            ---
+            **Downloads:**
+            - **Setup Installer** (`Riri.Player-Setup-${{ steps.version.outputs.version }}-win-x64.exe`) - Full installer with Start Menu/Desktop shortcuts
+            - **Portable** (`Riri.Player-Portable-${{ steps.version.outputs.version }}-win-x64.exe`) - No installation required, run directly
+
+            **Installation:**
+            1. Download the appropriate file for your needs
+            2. Run the installer or portable executable
+            3. The app will automatically check for updates on startup
+
+            **Full Changelog:** https://github.com/feelthevenom/Riri-Player/compare/${{ steps.changelog.outputs.previous_tag != '' && format('{0}...{1}', steps.changelog.outputs.previous_tag, github.ref_name) || github.ref_name }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: |
+            release/latest.yml
+            release/Riri.Player-Setup-${{ steps.version.outputs.version }}-win-x64.exe
+            release/Riri.Player-Setup-${{ steps.version.outputs.version }}-win-x64.exe.blockmap
+            release/Riri.Player-Portable-${{ steps.version.outputs.version }}-win-x64.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify published release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ASSET_NAMES="$(gh api "repos/${{ github.repository }}/releases/tags/${{ github.ref_name }}" --jq '.assets[].name')"
+          for REQUIRED_ASSET in \
+            "latest.yml" \
+            "Riri.Player-Setup-${{ steps.version.outputs.version }}-win-x64.exe" \
+            "Riri.Player-Setup-${{ steps.version.outputs.version }}-win-x64.exe.blockmap" \
+            "Riri.Player-Portable-${{ steps.version.outputs.version }}-win-x64.exe"
+          do
+            if ! grep -Fxq "$REQUIRED_ASSET" <<< "$ASSET_NAMES"; then
+              echo "Missing release asset: $REQUIRED_ASSET"
+              exit 1
+            fi
+          done

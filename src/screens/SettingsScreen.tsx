@@ -133,7 +133,15 @@ export const SettingsScreen: React.FC = () => {
   const backupFileRef = useRef<HTMLInputElement | null>(null);
 
   // Update state
-  const [updateStatus, setUpdateStatus] = useState<{ status: string; info?: any; error?: string } | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<{
+    status: string;
+    info?: any;
+    error?: string;
+    currentVersion?: string;
+    latestVersion?: string;
+    metadataMissing?: boolean;
+    releaseUrl?: string;
+  } | null>(null);
   const [updateProgress, setUpdateProgress] = useState<{ percent: number; bytesPerSecond: number; total: number; transferred: number } | null>(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [downloadingUpdate, setDownloadingUpdate] = useState(false);
@@ -194,15 +202,38 @@ export const SettingsScreen: React.FC = () => {
       }
       const result = await api.checkForUpdates();
       if (result.ok) {
-        if (result.updateInfo) {
-          setUpdateStatus({ status: 'available', info: result.updateInfo });
+        // `updateInfo` is always populated (latest server version), so rely on
+        // `isUpdateAvailable` to decide whether an update is actually available.
+        if (result.isUpdateAvailable && result.updateInfo) {
+          setUpdateStatus({
+            status: 'available',
+            info: result.updateInfo,
+            currentVersion: result.currentVersion,
+          });
           showToast(`Update available: v${result.updateInfo.version}`, 'info');
         } else {
-          setUpdateStatus({ status: 'not-available' });
-          showToast('You are on the latest version', 'info');
+          const currentVersion = result.currentVersion || result.updateInfo?.version;
+          setUpdateStatus({
+            status: 'not-available',
+            info: result.updateInfo,
+            currentVersion,
+          });
+          showToast(
+            currentVersion
+              ? `You are on the latest version (v${currentVersion})`
+              : 'You are on the latest version',
+            'info',
+          );
         }
       } else {
-        setUpdateStatus({ status: 'error', error: result.error });
+        setUpdateStatus({
+          status: 'error',
+          error: result.error,
+          currentVersion: result.currentVersion,
+          latestVersion: result.latestVersion,
+          metadataMissing: result.metadataMissing,
+          releaseUrl: result.releaseUrl,
+        });
         showToast(`Update check failed: ${result.error}`, 'error');
       }
     } catch (err) {
@@ -210,6 +241,21 @@ export const SettingsScreen: React.FC = () => {
       showToast('Update check failed', 'error');
     } finally {
       setCheckingUpdate(false);
+    }
+  };
+
+  const openReleasePage = async () => {
+    const releaseUrl = updateStatus?.releaseUrl;
+    if (!releaseUrl) return;
+
+    try {
+      const api = (window as any).electronAPI;
+      const result = await api.openReleasePage?.(releaseUrl);
+      if (result && !result.ok) {
+        showToast(`Could not open the release page: ${result.error}`, 'error');
+      }
+    } catch (err) {
+      showToast('Could not open the release page', 'error');
     }
   };
 
@@ -1009,7 +1055,10 @@ export const SettingsScreen: React.FC = () => {
                 {updateStatus.status === 'not-available' && (
                   <>
                     <CheckCircle className="w-4 h-4 text-emerald-400" />
-                    <span className="text-xs font-semibold text-emerald-400">You are on the latest version</span>
+                    <span className="text-xs font-semibold text-emerald-400">
+                      You are on the latest version
+                      {updateStatus.currentVersion ? ` (v${updateStatus.currentVersion})` : ''}
+                    </span>
                   </>
                 )}
                 {updateStatus.status === 'downloaded' && (
@@ -1077,6 +1126,18 @@ export const SettingsScreen: React.FC = () => {
                   >
                     <CheckCircle className="w-3.5 h-3.5" />
                     <span>Install & Restart</span>
+                  </button>
+                )}
+                {updateStatus.status === 'error' && updateStatus.metadataMissing && updateStatus.releaseUrl && (
+                  <button
+                    type="button"
+                    onClick={openReleasePage}
+                    className="flex items-center gap-2 px-3 py-2 rounded-xl bg-[var(--md-primary)] text-[var(--md-on-primary)] text-xs font-bold cursor-pointer"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>
+                      Download v{updateStatus.latestVersion || 'latest'} manually
+                    </span>
                   </button>
                 )}
                 {updateStatus.status === 'error' && (
