@@ -1,0 +1,45 @@
+{
+  "appId": "com.riri.player",
+  "productName": "Riri Player",
+  "copyright": "Riri Player Desktop Client",
+  "directories": {
+    "output": "release"
+  },
+  "files": [
+    "dist/**/*",
+    "electron/**/*",
+    "public/icon.png",
+    "package.json"
+  ],
+  "win": {
+    "icon": "public/icon.png",
+    "target": [
+      {
+        "target": "nsis",
+        "arch": ["x64"]
+      },
+      {
+        "target": "portable",
+        "arch": ["x64"]
+      }
+    ]
+  },
+  "nsis": {
+    "oneClick": false,
+    "perMachine": false,
+    "allowElevation": true,
+    "allowToChangeInstallationDirectory": true,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "deleteAppDataOnUninstall": false,
+    "artifactName": "${productName}-Setup-${version}-win-${arch}.${ext}"
+  },
+  "portable": {
+    "artifactName": "${productName}-Portable-${version}-win-${arch}.${ext}"
+  },
+  "publish": {
+    "provider": "github",
+    "owner": "feelthevenom",
+    "repo": "Riri-Player"
+  }
+}

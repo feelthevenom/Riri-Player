@@ -1,0 +1,5 @@
+{
+  "name": "Riri Player",
+  "description": "High-performance, privacy-focused YouTube Music and local audio player built with Material 3 Expressive design.",
+  "requestFramePermissions": []
+}
