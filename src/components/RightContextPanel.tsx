@@ -14,6 +14,7 @@ export const RightContextPanel: React.FC = () => {
     settings,
     updateSettings,
     activeTrackLyrics,
+    toggleLyricsLanguage,
     queue,
   } = useRiriPlayer();
 
@@ -60,6 +61,19 @@ export const RightContextPanel: React.FC = () => {
             <Mic2 className="w-3.5 h-3.5" />
             Lyrics
           </button>
+          {activeTrackLyrics.syncedLyrics && activeTrackLyrics.englishLyrics && (
+            <button
+              type="button"
+              onClick={() => toggleLyricsLanguage()}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+                settings.lyricsLanguage === 'ENGLISH'
+                  ? 'bg-[var(--md-primary)] text-[var(--md-on-primary)]'
+                  : 'text-[var(--md-on-surface-variant)] hover:text-[var(--md-on-surface)]'
+              }`}
+            >
+              {settings.lyricsLanguage === 'ENGLISH' ? 'Native' : 'English'}
+            </button>
+          )}
           <button
             type="button"
             onClick={() => setRightPanel('queue')}
@@ -139,6 +153,11 @@ export const RightContextPanel: React.FC = () => {
               parsedLyrics.map((line, i) => {
                 const isActive = i === activeLineIdx;
                 const tr = activeTrackLyrics.translations[i];
+                const displayText =
+                  settings.lyricsLanguage === 'ENGLISH' &&
+                  activeTrackLyrics.englishLyrics?.[i]
+                    ? activeTrackLyrics.englishLyrics[i]
+                    : line.text;
                 return (
                   <button
                     key={`${line.timeMs}-${i}`}
@@ -154,8 +173,8 @@ export const RightContextPanel: React.FC = () => {
                           : 'text-[var(--md-on-surface)]/80 hover:text-[var(--md-on-surface)]'
                     }`}
                   >
-                    <div>{line.text}</div>
-                    {tr && tr.toLowerCase() !== line.text.toLowerCase() && (
+                    <div>{displayText}</div>
+                    {tr && tr.toLowerCase() !== displayText.toLowerCase() && (
                       <div className="text-xs font-normal opacity-75 mt-0.5">{tr}</div>
                     )}
                   </button>

@@ -273,6 +273,7 @@ interface RiriPlayerContextValue {
   clearQueue: () => void;
   cycleRepeatMode: () => void;
   toggleShuffle: () => void;
+  toggleLyricsLanguage: () => void;
 
   toggleLike: (trackId: string, trackData?: Track) => void;
   isTrackLiked: (trackId: string) => boolean;
@@ -311,6 +312,7 @@ interface RiriPlayerContextValue {
   activeTrackLyrics: {
     syncedLyrics: string | null;
     plainLyrics: string | null;
+    englishLyrics: string[] | null;
     translations: string[];
     source: string | null;
     loading: boolean;
@@ -483,10 +485,11 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const [activeTrackLyrics, setActiveTrackLyrics] = useState<{
     syncedLyrics: string | null;
     plainLyrics: string | null;
+    englishLyrics: string[] | null;
     translations: string[];
     source: string | null;
     loading: boolean;
-  }>({ syncedLyrics: null, plainLyrics: null, translations: [], source: null, loading: false });
+  }>({ syncedLyrics: null, plainLyrics: null, englishLyrics: null, translations: [], source: null, loading: false });
 
   const ytAccounts = useMemo<YtAccountSummary[]>(
     () => ytAuthStatus?.accounts || [],
@@ -1092,12 +1095,13 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     }
   }, [activeEq]);
 
-  // Fetch synced lyrics (LRCLIB + YouTube Music fallback) + optional translation
+  // Fetch synced lyrics (LRCLIB + YouTube Music fallback) + optional translation + English transliteration
   const fetchLyricsForTrack = useCallback(
     async (track: Track) => {
       setActiveTrackLyrics({
         syncedLyrics: track.syncedLyrics || null,
         plainLyrics: track.plainLyrics || null,
+        englishLyrics: null,
         translations: [],
         source: null,
         loading: !(track.syncedLyrics || track.plainLyrics),
@@ -1122,6 +1126,34 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
           source = data.source || null;
         } catch {
           // ignore
+        }
+      }
+
+      // Fetch English transliteration for non-Latin script lyrics
+      let englishLyrics: string[] | null = null;
+      if (synced) {
+        const parsed = parseLrcLyrics(synced);
+        if (parsed.length > 0) {
+          // Check if lyrics contain non-Latin characters
+          const hasNonLatin = parsed.some((l) => /[^\u0000-\u007F]/.test(l.text));
+          if (hasNonLatin) {
+            try {
+              const trRes = await apiFetch('/api/transliterate-lyrics', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  lines: parsed.map((l) => l.text),
+                  targetLang: 'en',
+                }),
+              });
+              if (trRes.ok) {
+                const trJson = (await trRes.json()) as { transliteration?: string[] };
+                englishLyrics = trJson.transliteration || null;
+              }
+            } catch {
+              englishLyrics = null;
+            }
+          }
         }
       }
 
@@ -1152,6 +1184,7 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       setActiveTrackLyrics({
         syncedLyrics: synced,
         plainLyrics: plain,
+        englishLyrics,
         translations,
         source,
         loading: false,
@@ -1161,6 +1194,7 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       queueNextResult?.lyricsBrowseId,
       settings.contentLanguage,
       settings.contentRegion,
+      settings.lyricsLanguage,
       settings.showSyncedLyricsTranslation,
       settings.translationLanguage,
     ],
@@ -1171,6 +1205,7 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       setActiveTrackLyrics({
         syncedLyrics: null,
         plainLyrics: null,
+        englishLyrics: null,
         translations: [],
         source: null,
         loading: false,
@@ -2678,6 +2713,12 @@ const playTrack = useCallback(
     setSettings((prev) => ({ ...prev, ...patch }));
   }, []);
 
+  const toggleLyricsLanguage = useCallback(() => {
+    updateSettings({
+      lyricsLanguage: settings.lyricsLanguage === 'ENGLISH' ? 'NATIVE' : 'ENGLISH',
+    });
+  }, [settings.lyricsLanguage, updateSettings]);
+
   const selectEqProfile = useCallback((id: string) => {
     setEqState((prev) => ({ ...prev, activeId: id }));
   }, []);
@@ -2826,6 +2867,7 @@ const playTrack = useCallback(
         darkMode: settings.darkMode,
         themeSurfaceStyle: settings.themeSurfaceStyle,
         activeLyricLine,
+        lyricsLanguage: settings.lyricsLanguage,
       },
     });
     return () => ch.close();
@@ -2881,6 +2923,7 @@ const playTrack = useCallback(
             darkMode: settings.darkMode,
             themeSurfaceStyle: settings.themeSurfaceStyle,
             activeLyricLine,
+            lyricsLanguage: settings.lyricsLanguage,
           },
         });
       } else if (e.data?.type === 'CMD') {
@@ -2901,6 +2944,9 @@ const playTrack = useCallback(
         if (e.data.action === 'lyrics') {
           void closeMiniPlayer(false);
           toggleRightPanel('lyrics');
+        }
+        if (e.data.action === 'toggleLyricsLanguage') {
+          toggleLyricsLanguage();
         }
         if (e.data.action === 'open-cinema') {
           closeMiniPlayer(true);
@@ -2925,8 +2971,10 @@ const playTrack = useCallback(
     settings.themeColor,
     settings.themeSurfaceStyle,
     settings.volume,
+    settings.lyricsLanguage,
     togglePlayPause,
     toggleRightPanel,
+    toggleLyricsLanguage,
     updateSettings,
   ]);
 
@@ -3100,6 +3148,7 @@ const playTrack = useCallback(
     clearQueue,
     cycleRepeatMode,
     toggleShuffle,
+    toggleLyricsLanguage,
 
     toggleLike,
     isTrackLiked,

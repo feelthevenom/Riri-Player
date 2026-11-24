@@ -338,6 +338,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   showSyncedLyricsTranslation: false,
   translationLanguage: 'ENGLISH',
   lyricsFontScale: 1.0,
+  lyricsLanguage: 'NATIVE',
   pauseSearchHistory: false,
   pauseListenHistory: false,
   ytMusicEnabled: true,

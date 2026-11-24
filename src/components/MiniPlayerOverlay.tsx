@@ -48,12 +48,14 @@ interface MiniPlayerCardProps {
   shuffleEnabled: boolean;
   volume: number;
   isLocked: boolean;
+  lyricsLanguage: 'NATIVE' | 'ENGLISH';
   onToggleLock: () => void;
   onPrev: () => void;
   onTogglePlayPause: () => void;
   onNext: () => void;
   onCycleRepeatMode: () => void;
   onToggleShuffle: () => void;
+  onToggleLyricsLanguage: () => void;
   onSeek: (sec: number) => void;
   onSetVolume: (vol: number) => void;
   onToggleLike?: () => void;
@@ -77,6 +79,7 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
   repeatMode = 'OFF',
   shuffleEnabled = false,
   volume = 0.85,
+  lyricsLanguage = 'NATIVE',
   isLocked,
   onToggleLock,
   onPrev,
@@ -84,6 +87,7 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
   onNext,
   onCycleRepeatMode,
   onToggleShuffle,
+  onToggleLyricsLanguage,
   onSeek,
   onSetVolume,
   onToggleLike,
@@ -675,7 +679,25 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
             ) : (
               <MicOff className={`w-3 h-3 stroke-current`} />
             )}
-            <span>{showLyrics ? 'Lyrics On' : 'Lyrics'}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => onToggleLyricsLanguage()}
+            aria-label={
+              lyricsLanguage === 'ENGLISH'
+                ? 'Switch to native lyrics'
+                : 'Switch to English lyrics'
+            }
+            className={`flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-medium transition-colors cursor-pointer ${
+              lyricsLanguage === 'ENGLISH'
+                ? miniOverlayTheme === 'DYNAMIC_ACCENT' || miniOverlayTheme === 'RIRI_GLASS'
+                  ? 'text-[var(--md-primary)]'
+                  : `text-[${palettePrimary}]`
+                : secondaryTextClass
+            }`}
+          >
+            {lyricsLanguage === 'ENGLISH' ? 'Native' : 'Eng'}
           </button>
         </div>
       </div>
@@ -706,13 +728,27 @@ export const MiniPlayerOverlay: React.FC = () => {
     volume,
     updateSettings,
     activeTrackLyrics,
+    toggleLyricsLanguage,
   } = useRiriPlayer();
 
   const [isLocked, setIsLocked] = useState(false);
 
   const parsedLyrics = useMemo(
-    () => parseLrcLyrics(activeTrackLyrics.syncedLyrics),
-    [activeTrackLyrics.syncedLyrics],
+    () => {
+      if (settings.lyricsLanguage === 'ENGLISH' && activeTrackLyrics.englishLyrics) {
+        const original = parseLrcLyrics(activeTrackLyrics.syncedLyrics);
+        return activeTrackLyrics.englishLyrics.map((text, i) => ({
+          text,
+          timeMs: original[i]?.timeMs ?? i * 1000,
+        }));
+      }
+      return parseLrcLyrics(activeTrackLyrics.syncedLyrics);
+    },
+    [
+      activeTrackLyrics.syncedLyrics,
+      activeTrackLyrics.englishLyrics,
+      settings.lyricsLanguage,
+    ],
   );
   const activeLyricIdx = useMemo(
     () => findActiveLyricIndex(parsedLyrics, positionSec * 1000, settings.lyricsOffsetMs),
@@ -748,6 +784,7 @@ export const MiniPlayerOverlay: React.FC = () => {
         repeatMode={repeatMode}
         shuffleEnabled={shuffleEnabled}
         volume={volume ?? settings.volume}
+        lyricsLanguage={settings.lyricsLanguage}
         isLocked={isLocked}
         onToggleLock={() => setIsLocked((v) => !v)}
         onPrev={() => void prevTrack()}
@@ -755,6 +792,7 @@ export const MiniPlayerOverlay: React.FC = () => {
         onNext={() => void nextTrack()}
         onCycleRepeatMode={() => void cycleRepeatMode()}
         onToggleShuffle={() => void toggleShuffle()}
+        onToggleLyricsLanguage={() => void toggleLyricsLanguage()}
         onSeek={seekTo}
         onSetVolume={(v) => void updateSettings({ volume: v })}
         onToggleLike={
@@ -785,6 +823,7 @@ export const StandaloneMiniOverlayWindow: React.FC = () => {
     volume?: number;
     liked?: boolean;
     activeLyricLine?: string | null;
+    lyricsLanguage?: 'NATIVE' | 'ENGLISH';
   }>({
     currentTrack: null,
     isPlaying: false,
@@ -800,6 +839,7 @@ export const StandaloneMiniOverlayWindow: React.FC = () => {
     volume: 0.85,
     liked: false,
     activeLyricLine: null,
+    lyricsLanguage: 'NATIVE',
   });
 
   const stateRef = useRef(state);
@@ -960,6 +1000,7 @@ export const StandaloneMiniOverlayWindow: React.FC = () => {
       repeatMode={state.repeatMode ?? 'OFF'}
       shuffleEnabled={state.shuffleEnabled ?? false}
       volume={localVolume}
+      lyricsLanguage={state.lyricsLanguage ?? 'NATIVE'}
       isLocked={isLocked}
       onToggleLock={() => setIsLocked((prev) => !prev)}
       onPrev={() => sendCmd('prev')}
@@ -967,6 +1008,7 @@ export const StandaloneMiniOverlayWindow: React.FC = () => {
       onNext={() => sendCmd('next')}
       onCycleRepeatMode={() => sendCmd('repeat')}
       onToggleShuffle={() => sendCmd('shuffle')}
+      onToggleLyricsLanguage={() => sendCmd('toggleLyricsLanguage')}
       onSeek={sendSeek}
       onSetVolume={sendVolume}
       onToggleLike={() => sendCmd('like')}

@@ -288,6 +288,7 @@ export interface AppSettings {
   showSyncedLyricsTranslation: boolean;
   translationLanguage: string;
   lyricsFontScale: number;
+  lyricsLanguage: 'NATIVE' | 'ENGLISH';
   pauseSearchHistory: boolean;
   pauseListenHistory: boolean;
   ytMusicEnabled: boolean;
