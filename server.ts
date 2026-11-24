@@ -32,6 +32,9 @@ import { innerTubePost } from './electron/ytm/innertube';
 import { setYtmLikeStatus, syncYtmLibrary } from './electron/ytm/library';
 import type { SpotifySyncSchedule } from './src/types/music';
 import {
+  transliterateLyrics,
+} from './src/utils/transliterate';
+import {
   AudioQuality,
   AdaptiveAudioFormat,
   formatQualityBadge,
@@ -1427,21 +1430,8 @@ export async function startAppServer(opts: StartAppServerOptions = {}): Promise<
       return;
     }
     try {
-      // Use Google Translate's free API for transliteration (auto-detect source to English)
-      // This provides Latin-script transliteration for non-Latin scripts where available
-      const joined = lines.slice(0, 120).join('\n');
-      const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(
-        targetLang,
-      )}&dt=t&q=${encodeURIComponent(joined)}`;
-      const trRes = await fetch(url, { signal: AbortSignal.timeout(8000) });
-      if (!trRes.ok) {
-        res.json({ ok: false, transliteration: [] });
-        return;
-      }
-      const parsed = (await trRes.json()) as unknown[];
-      const chunks = Array.isArray(parsed?.[0]) ? (parsed[0] as Array<[string]>) : [];
-      const combined = chunks.map((c) => c?.[0] || '').join('');
-      res.json({ ok: true, transliteration: combined.split('\n') });
+      const transliterated = transliterateLyrics(lines);
+      res.json({ ok: true, transliteration: transliterated });
     } catch {
       res.json({ ok: false, transliteration: [] });
     }
