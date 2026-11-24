@@ -24,6 +24,8 @@ export interface ElectronYtmBridge {
   getProxyConfig?: () => Promise<{ baseUrl: string; token: string }>;
   auth?: {
     ytmStatus: () => Promise<YtAuthStatusPayload>;
+    ytmVaultDiagnostic: () => Promise<{ error?: string; unreadableFile?: boolean } | null>;
+    ytmInvalidateVaultCache: () => Promise<{ ok: boolean }>;
     ytmLogin: (options?: { cleanPartition?: boolean }) => Promise<{
       ok: boolean;
       status?: YtAuthStatusPayload;
@@ -224,13 +226,28 @@ export async function initYtmProxyConfig(maxRetries = 10): Promise<void> {
 
 export function decorateProxyUrl(url: string): string {
   if (!url) return url;
+  // data: and external non-localhost URLs are left untouched.
+  if (url.startsWith('data:')) return url;
+  if (url.startsWith('http://') || url.startsWith('https://')) {
+    try {
+      const parsed = new URL(url);
+      // Internal localhost proxy URLs: strip the stale origin/port so we can
+      // re-apply the current base + launch token.
+      if (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost') {
+        url = parsed.pathname + parsed.search;
+      } else {
+        return url;
+      }
+    } catch {
+      return url;
+    }
+  }
   if (proxyToken && url.startsWith('/api/')) {
     const base = proxyBaseUrl || '';
     const sep = url.includes('?') ? '&' : '?';
-    if (!url.includes('token=')) {
-      return `${base}${url}${sep}token=${encodeURIComponent(proxyToken)}`;
-    }
-    return `${base}${url}`;
+    // Strip any stale token so it is always replaced with the current one.
+    const clean = url.replace(/[?&]token=[^&]*/, '');
+    return `${base}${clean}${sep}token=${encodeURIComponent(proxyToken)}`;
   }
   return url;
 }
@@ -252,6 +269,18 @@ export const ytmClient = {
     if (api?.auth) return await api.auth.ytmStatus();
     const res = await apiFetch('/api/auth/ytm/status');
     return (await res.json()) as YtAuthStatusPayload;
+  },
+
+  async getYtmVaultDiagnostic(): Promise<{ error?: string; unreadableFile?: boolean } | null> {
+    const api = getElectronBridge();
+    if (api?.auth) return await api.auth.ytmVaultDiagnostic();
+    return null;
+  },
+
+  async invalidateYtmVaultCache(): Promise<{ ok: boolean }> {
+    const api = getElectronBridge();
+    if (api?.auth) return await api.auth.ytmInvalidateVaultCache();
+    return { ok: false };
   },
 
   async loginYtm(options?: { cleanPartition?: boolean }) {
@@ -334,7 +363,7 @@ export const ytmClient = {
       likedTracks: (raw.likedTracks || []).map(decorateTrackThumb),
       playlists: (raw.playlists || []).map((pl) => ({
         ...pl,
-        thumbnailUrl: pl.thumbnailUrl ? pl.thumbnailUrl : undefined,
+        thumbnailUrl: pl.thumbnailUrl ? decorateProxyUrl(pl.thumbnailUrl) : undefined,
         tracks: (pl.tracks || []).map(decorateTrackThumb),
       })),
       savedAlbums: (raw.savedAlbums || []).map(decorateBrowseThumb),
@@ -435,7 +464,7 @@ export const ytmClient = {
         })();
     return {
       ...data,
-      thumbnailUrl: data.thumbnailUrl ? data.thumbnailUrl : '',
+      thumbnailUrl: data.thumbnailUrl ? decorateProxyUrl(data.thumbnailUrl) : '',
       tracks: (data.tracks || []).map(decorateTrackThumb),
       items: (data.items || []).map(decorateBrowseThumb),
     };
@@ -663,7 +692,7 @@ export const ytmClient = {
       likedTracks: (data.likedTracks || []).map(decorateTrackThumb),
       playlists: (data.playlists || []).map((pl) => ({
         ...pl,
-        imageUrl: pl.imageUrl ? pl.imageUrl : undefined,
+        imageUrl: pl.imageUrl ? decorateProxyUrl(pl.imageUrl) : undefined,
         tracks: (pl.tracks || []).map(decorateTrackThumb),
       })),
       savedAlbums: (data.savedAlbums || []).map(decorateBrowseThumb),

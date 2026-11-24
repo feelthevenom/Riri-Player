@@ -943,10 +943,13 @@ var DEFAULT_VAULT = {
   spotify: null
 };
 var cachedVault = null;
+var vaultCacheValid = false;
+var vaultDiagnostic = null;
 var electronBridge = {};
 function configureCredentialStorage(opts) {
   electronBridge = opts;
   cachedVault = null;
+  vaultCacheValid = false;
 }
 function getVaultFilePath() {
   const baseDir = electronBridge.userDataPath || import_node_path.default.join(import_node_os.default.homedir(), ".riri-player");
@@ -985,24 +988,46 @@ function decryptFallback(encoded) {
   ]);
   return dec.toString("utf8");
 }
+async function decryptVaultBuffer(buf) {
+  const ss = electronBridge.safeStorage;
+  if (ss?.decryptStringAsync) {
+    let lastErr = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        return await ss.decryptStringAsync(buf);
+      } catch (err2) {
+        lastErr = err2;
+        await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+      }
+    }
+    throw lastErr;
+  }
+  if (ss?.isEncryptionAvailable && ss.decryptString && ss.isEncryptionAvailable()) {
+    return ss.decryptString(buf);
+  }
+  throw new Error("Encryption is not available.");
+}
 async function readVault() {
-  if (cachedVault) return cachedVault;
+  if (vaultCacheValid && cachedVault) return cachedVault;
   const filePath = getVaultFilePath();
   if (!import_node_fs.default.existsSync(filePath)) {
-    cachedVault = { ...DEFAULT_VAULT };
-    return cachedVault;
+    return { ...DEFAULT_VAULT };
   }
+  vaultDiagnostic = null;
   try {
     const raw = import_node_fs.default.readFileSync(filePath, "utf8").trim();
     let jsonStr = "";
     if (raw.startsWith("SAFE:")) {
-      const ss = electronBridge.safeStorage;
       const buf = Buffer.from(raw.slice(5), "base64");
-      if (ss?.isAsyncEncryptionAvailable && ss.decryptStringAsync && await ss.isAsyncEncryptionAvailable()) {
-        jsonStr = await ss.decryptStringAsync(buf);
-      } else if (ss?.isEncryptionAvailable && ss.decryptString && ss.isEncryptionAvailable()) {
-        jsonStr = ss.decryptString(buf);
-      } else {
+      try {
+        jsonStr = await decryptVaultBuffer(buf);
+      } catch (err2) {
+        vaultDiagnostic = {
+          error: err2 instanceof Error ? err2.message : "Failed to decrypt session vault.",
+          unreadableFile: true
+        };
+        vaultCacheValid = false;
+        cachedVault = null;
         return { ...DEFAULT_VAULT };
       }
     } else if (raw.startsWith("AES:")) {
@@ -1017,21 +1042,39 @@ async function readVault() {
       anonymousVisitorData: parsed.anonymousVisitorData || "",
       spotify: parsed.spotify || null
     };
+    vaultCacheValid = true;
+    vaultDiagnostic = null;
     return cachedVault;
-  } catch {
-    cachedVault = { ...DEFAULT_VAULT };
-    return cachedVault;
+  } catch (err2) {
+    vaultDiagnostic = {
+      error: err2 instanceof Error ? err2.message : "Failed to read session vault.",
+      unreadableFile: true
+    };
+    vaultCacheValid = false;
+    cachedVault = null;
+    return { ...DEFAULT_VAULT };
   }
 }
 async function writeVault(vault) {
   cachedVault = vault;
+  vaultCacheValid = true;
   const filePath = getVaultFilePath();
   const plaintext = JSON.stringify(vault);
   let serialized = "";
   const ss = electronBridge.safeStorage;
-  if (ss?.isAsyncEncryptionAvailable && ss.encryptStringAsync && await ss.isAsyncEncryptionAvailable()) {
-    const enc = await ss.encryptStringAsync(plaintext);
-    serialized = `SAFE:${enc.toString("base64")}`;
+  if (ss?.encryptStringAsync) {
+    let lastErr = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const enc = await ss.encryptStringAsync(plaintext);
+        serialized = `SAFE:${enc.toString("base64")}`;
+        break;
+      } catch (err2) {
+        lastErr = err2;
+        await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+      }
+    }
+    if (!serialized) throw lastErr;
   } else if (ss?.isEncryptionAvailable && ss.encryptString && ss.isEncryptionAvailable()) {
     const enc = ss.encryptString(plaintext);
     serialized = `SAFE:${enc.toString("base64")}`;
@@ -1042,6 +1085,13 @@ async function writeVault(vault) {
     import_node_fs.default.writeFileSync(filePath, serialized, { encoding: "utf8", mode: 384 });
   } catch {
   }
+}
+function getVaultDiagnostic() {
+  return vaultDiagnostic;
+}
+function invalidateVaultCache() {
+  vaultCacheValid = false;
+  cachedVault = null;
 }
 async function getActiveYtAccount() {
   const vault = await readVault();
@@ -42379,6 +42429,11 @@ function registerYtmIpcHandlers(params) {
     createElectronSpotifyBearerCapturer({ BrowserWindow, session })
   );
   ipcMain.handle("auth:ytm:status", () => getYtmAuthStatus());
+  ipcMain.handle("auth:ytm:vault-diagnostic", () => getVaultDiagnostic());
+  ipcMain.handle("auth:ytm:invalidate-vault-cache", () => {
+    invalidateVaultCache();
+    return { ok: true };
+  });
   ipcMain.handle(
     "auth:ytm:login",
     async (_ev, payload) => {

@@ -76,8 +76,8 @@ export const OVERLAY_THEME_CLASSES: Record<
 > = {
   GLASS: {
     container:
-      'bg-zinc-900/65 backdrop-blur-2xl border border-white/20 text-white shadow-[0_24px_48px_rgba(0,0,0,0.45)]',
-    muted: 'text-white/70',
+      'bg-[#18181d]/60 backdrop-blur-[36px] backdrop-saturate-[190%] border border-white/[0.22] text-white shadow-[0_20px_44px_-10px_rgba(0,0,0,0.65),inset_0_1px_0_0_rgba(255,255,255,0.34)]',
+    muted: 'text-white/65',
     label: 'Glass',
   },
   DARK: {
@@ -88,7 +88,7 @@ export const OVERLAY_THEME_CLASSES: Record<
   },
   LIGHT: {
     container:
-      'bg-white/85 backdrop-blur-xl border border-black/10 text-[#1C1618] shadow-2xl',
+      'bg-white/85 backdrop-blur-2xl backdrop-saturate-150 border border-black/10 text-[#1C1618] shadow-[0_20px_44px_-10px_rgba(0,0,0,0.22),inset_0_1px_0_0_rgba(255,255,255,0.8)]',
     muted: 'text-[#57484D]',
     label: 'Light',
   },
@@ -108,6 +108,11 @@ export const OVERLAY_THEME_CLASSES: Record<
     container: '',
     muted: '',
     label: 'Dynamic Accent',
+  },
+  RIRI_GLASS: {
+    container: 'riri-glass text-white',
+    muted: 'text-white/60',
+    label: 'Riri Glass',
   },
 };
 

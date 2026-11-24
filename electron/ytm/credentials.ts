@@ -56,6 +56,8 @@ const DEFAULT_VAULT: StoredVaultPayload = {
 };
 
 let cachedVault: StoredVaultPayload | null = null;
+let vaultCacheValid = false;
+let vaultDiagnostic: { error?: string; unreadableFile?: boolean; encryptionAvailable?: boolean } | null = null;
 let electronBridge: {
   userDataPath?: string;
   safeStorage?: {
@@ -81,6 +83,7 @@ export function configureCredentialStorage(opts: {
 }) {
   electronBridge = opts;
   cachedVault = null;
+  vaultCacheValid = false;
 }
 
 function getVaultFilePath(): string {
@@ -126,25 +129,61 @@ function decryptFallback(encoded: string): string {
   return dec.toString('utf8');
 }
 
-async function readVault(): Promise<StoredVaultPayload> {
-  if (cachedVault) return cachedVault;
-  const filePath = getVaultFilePath();
-  if (!fs.existsSync(filePath)) {
-    cachedVault = { ...DEFAULT_VAULT };
-    return cachedVault;
+async function decryptVaultBuffer(buf: Buffer): Promise<string> {
+  const ss = electronBridge.safeStorage;
+
+  // Per Electron docs, the async encryptor is initialized lazily the first time
+  // decryptStringAsync is called after app ready. Calling it directly triggers
+  // initialization — don't wait for isAsyncEncryptionAvailable() alone.
+  if (ss?.decryptStringAsync) {
+    let lastErr: unknown = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        return await ss.decryptStringAsync(buf);
+      } catch (err) {
+        lastErr = err;
+        // Brief backoff between retries to let the encryptor initialize.
+        await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+      }
+    }
+    throw lastErr;
   }
 
+  if (ss?.isEncryptionAvailable && ss.decryptString && ss.isEncryptionAvailable()) {
+    return ss.decryptString(buf);
+  }
+
+  throw new Error('Encryption is not available.');
+}
+
+async function readVault(): Promise<StoredVaultPayload> {
+  // Return cached successful read
+  if (vaultCacheValid && cachedVault) return cachedVault;
+
+  const filePath = getVaultFilePath();
+  if (!fs.existsSync(filePath)) {
+    // Don't cache a missing file — it may be created later (e.g. after sign-in).
+    return { ...DEFAULT_VAULT };
+  }
+
+  vaultDiagnostic = null;
   try {
     const raw = fs.readFileSync(filePath, 'utf8').trim();
     let jsonStr = '';
     if (raw.startsWith('SAFE:')) {
-      const ss = electronBridge.safeStorage;
       const buf = Buffer.from(raw.slice(5), 'base64');
-      if (ss?.isAsyncEncryptionAvailable && ss.decryptStringAsync && (await ss.isAsyncEncryptionAvailable())) {
-        jsonStr = await ss.decryptStringAsync(buf);
-      } else if (ss?.isEncryptionAvailable && ss.decryptString && ss.isEncryptionAvailable()) {
-        jsonStr = ss.decryptString(buf);
-      } else {
+      try {
+        jsonStr = await decryptVaultBuffer(buf);
+      } catch (err) {
+        // Preserve the unreadable vault file and report the error. Do NOT cache
+        // the empty result — safeStorage may not be ready yet on Windows, and
+        // the next call should retry decryption.
+        vaultDiagnostic = {
+          error: err instanceof Error ? err.message : 'Failed to decrypt session vault.',
+          unreadableFile: true,
+        };
+        vaultCacheValid = false;
+        cachedVault = null;
         return { ...DEFAULT_VAULT };
       }
     } else if (raw.startsWith('AES:')) {
@@ -160,33 +199,63 @@ async function readVault(): Promise<StoredVaultPayload> {
       anonymousVisitorData: parsed.anonymousVisitorData || '',
       spotify: parsed.spotify || null,
     };
+    vaultCacheValid = true;
+    vaultDiagnostic = null;
     return cachedVault;
-  } catch {
-    cachedVault = { ...DEFAULT_VAULT };
-    return cachedVault;
+  } catch (err) {
+    vaultDiagnostic = {
+      error: err instanceof Error ? err.message : 'Failed to read session vault.',
+      unreadableFile: true,
+    };
+    vaultCacheValid = false;
+    cachedVault = null;
+    return { ...DEFAULT_VAULT };
   }
 }
 
 async function writeVault(vault: StoredVaultPayload): Promise<void> {
   cachedVault = vault;
+  vaultCacheValid = true;
   const filePath = getVaultFilePath();
   const plaintext = JSON.stringify(vault);
   let serialized = '';
   const ss = electronBridge.safeStorage;
-  if (ss?.isAsyncEncryptionAvailable && ss.encryptStringAsync && (await ss.isAsyncEncryptionAvailable())) {
-    const enc = await ss.encryptStringAsync(plaintext);
-    serialized = `SAFE:${enc.toString('base64')}`;
+
+  // Encrypt with retry — the async encryptor initializes lazily on first call.
+  if (ss?.encryptStringAsync) {
+    let lastErr: unknown = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const enc = await ss.encryptStringAsync(plaintext);
+        serialized = `SAFE:${enc.toString('base64')}`;
+        break;
+      } catch (err) {
+        lastErr = err;
+        await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+      }
+    }
+    if (!serialized) throw lastErr;
   } else if (ss?.isEncryptionAvailable && ss.encryptString && ss.isEncryptionAvailable()) {
     const enc = ss.encryptString(plaintext);
     serialized = `SAFE:${enc.toString('base64')}`;
   } else {
     serialized = encryptFallback(plaintext);
   }
+
   try {
     fs.writeFileSync(filePath, serialized, { encoding: 'utf8', mode: 0o600 });
   } catch {
     // ignore disk failure
   }
+}
+
+export function getVaultDiagnostic(): { error?: string; unreadableFile?: boolean; encryptionAvailable?: boolean } | null {
+  return vaultDiagnostic;
+}
+
+export function invalidateVaultCache(): void {
+  vaultCacheValid = false;
+  cachedVault = null;
 }
 
 export async function getActiveYtAccount(): Promise<StoredYtAccount | null> {

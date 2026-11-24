@@ -38,7 +38,7 @@ export type SliderStyle = 'WAVY' | 'DEFAULT' | 'SLIM';
 
 export type RepeatMode = 'OFF' | 'ALL' | 'ONE';
 
-export type MiniOverlayTheme = 'GLASS' | 'DARK' | 'LIGHT' | 'ACCENT' | 'PURE_BLACK' | 'DYNAMIC_ACCENT';
+export type MiniOverlayTheme = 'GLASS' | 'DARK' | 'LIGHT' | 'ACCENT' | 'PURE_BLACK' | 'DYNAMIC_ACCENT' | 'RIRI_GLASS';
 
 export type MiniOverlayPin = 'FREE' | 'TOP_LEFT' | 'TOP_RIGHT' | 'BOTTOM_LEFT' | 'BOTTOM_RIGHT';
 

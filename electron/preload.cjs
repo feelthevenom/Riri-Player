@@ -58,6 +58,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // ArchiveTune-style YouTube Music + Spotify Session IPC (no raw cookies exposed)
   auth: {
     ytmStatus: () => ipcRenderer.invoke('auth:ytm:status'),
+    ytmVaultDiagnostic: () => ipcRenderer.invoke('auth:ytm:vault-diagnostic'),
+    ytmInvalidateVaultCache: () => ipcRenderer.invoke('auth:ytm:invalidate-vault-cache'),
     ytmLogin: (options) => ipcRenderer.invoke('auth:ytm:login', options),
     ytmCancel: () => ipcRenderer.invoke('auth:ytm:cancel'),
     ytmImportBrowser: (payload) => ipcRenderer.invoke('auth:ytm:import-browser', payload),

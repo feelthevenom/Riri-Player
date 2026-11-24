@@ -50,7 +50,7 @@ import {
   saveQueueStateToDb,
 } from '../utils/storageDb';
 import { runArchPluginSearch, resolveArchPluginStream } from '../utils/archPluginRunner';
-import { parseLrcLyrics } from '../utils/lyricsParser';
+import { findActiveLyricIndex, parseLrcLyrics } from '../utils/lyricsParser';
 import {
   appendUniqueQueueSuggestions,
   replaceUpcomingQueueWithRadio,
@@ -67,6 +67,28 @@ import {
 const SETTINGS_KEY = 'ririp_c_settings_v2';
 const EQ_STORAGE_KEY = 'ririp_c_eq_v2';
 const MINI_OVERLAY_CHANNEL = 'riri_mini_overlay';
+const YT_AUTH_LOCAL_KEY = 'ririp_c_yt_auth_v1';
+
+function redecorateTrack(t: Track): Track {
+  return {
+    ...t,
+    thumbnailUrl: t.thumbnailUrl ? decorateProxyUrl(t.thumbnailUrl) : t.thumbnailUrl,
+  };
+}
+
+function redecoratePlaylist(pl: Playlist): Playlist {
+  return {
+    ...pl,
+    coverUrl: pl.coverUrl ? decorateProxyUrl(pl.coverUrl) : undefined,
+  };
+}
+
+function redecorateBrowseItem(item: YtMusicBrowseItem): YtMusicBrowseItem {
+  return {
+    ...item,
+    thumbnailUrl: item.thumbnailUrl ? decorateProxyUrl(item.thumbnailUrl) : item.thumbnailUrl,
+  };
+}
 
 export type RightPanelTab = 'closed' | 'lyrics' | 'queue';
 
@@ -140,8 +162,10 @@ interface RiriPlayerContextValue {
   searchHistory: string[];
   plugins: ArchPlugin[];
   settings: AppSettings;
+  volume: number;
 
   ytAuthStatus: YtAuthStatusPayload | null;
+  ytVaultDiagnostic: { error?: string; unreadableFile?: boolean } | null;
   ytAccounts: YtAccountSummary[];
   activeYtAccount: YtAccountSummary | null;
   signingInYtMusic: boolean;
@@ -379,6 +403,7 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const [plugins, setPlugins] = useState<ArchPlugin[]>([]);
 
   const [ytAuthStatus, setYtAuthStatus] = useState<YtAuthStatusPayload | null>(null);
+  const [ytVaultDiagnostic, setYtVaultDiagnostic] = useState<{ error?: string; unreadableFile?: boolean } | null>(null);
   const [signingInYtMusic, setSigningInYtMusic] = useState(false);
   const [ytSavedAlbums, setYtSavedAlbums] = useState<YtMusicBrowseItem[]>([]);
   const [ytFollowedArtists, setYtFollowedArtists] = useState<YtMusicBrowseItem[]>([]);
@@ -551,12 +576,86 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   useEffect(() => {
     if (!proxyReady) return;
     let cancelled = false;
-    void ytmClient
-      .getYtmStatus()
-      .then((status) => {
-        if (!cancelled) setYtAuthStatus(status);
-      })
-      .catch(() => undefined);
+    let retryTimer: NodeJS.Timeout | null = null;
+
+    // Track whether we restored from localStorage backup.
+    let restoredFromLocalStorage = false;
+
+    // Restore auth status from localStorage backup immediately (before vault read).
+    // This ensures the user stays signed in even if safeStorage decryption fails.
+    try {
+      const saved = localStorage.getItem(YT_AUTH_LOCAL_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved) as YtAuthStatusPayload;
+        if (parsed?.loggedIn) {
+          setYtAuthStatus(parsed);
+          restoredFromLocalStorage = true;
+        }
+      }
+    } catch {
+      // ignore localStorage parse errors
+    }
+
+    // On every app start, invalidate the vault cache so a fresh read is forced.
+    void ytmClient.invalidateYtmVaultCache();
+
+    const fetchAuth = async () => {
+      if (cancelled) return;
+      const status = await ytmClient.getYtmStatus();
+      if (!cancelled) {
+        // Never overwrite a valid localStorage-restored session with empty vault data.
+        // Only update if:
+        //   - We haven't restored from localStorage yet, OR
+        //   - The vault actually returned a logged-in status (fresher than backup)
+        if (!restoredFromLocalStorage || status.loggedIn) {
+          setYtAuthStatus(status);
+          // Persist successful auth status to localStorage as a backup.
+          if (status.loggedIn) {
+            try {
+              localStorage.setItem(YT_AUTH_LOCAL_KEY, JSON.stringify(status));
+              restoredFromLocalStorage = true;
+            } catch {
+              // ignore
+            }
+          }
+        }
+      }
+    };
+
+    const initAuth = async () => {
+      if (cancelled) return;
+
+      // Fetch vault diagnostic first so we know whether the vault is readable.
+      const diagnostic = await ytmClient.getYtmVaultDiagnostic().catch(() => null);
+      if (!cancelled) {
+        setYtVaultDiagnostic(diagnostic ?? null);
+      }
+
+      // Try auth status immediately.
+      await fetchAuth();
+
+      // If not logged in and the vault is unreadable (safeStorage not ready yet),
+      // retry after a short delay so the async encryptor can initialize.
+      // Skip retry if we already restored a valid session from localStorage.
+      if (!cancelled && !restoredFromLocalStorage && diagnostic?.unreadableFile) {
+        retryTimer = setTimeout(() => {
+          if (cancelled) return;
+          void ytmClient.invalidateYtmVaultCache();
+          void fetchAuth();
+
+          // Second retry if still not logged in.
+          if (!ytAuthStatus?.loggedIn) {
+            retryTimer = setTimeout(() => {
+              if (cancelled) return;
+              void ytmClient.invalidateYtmVaultCache();
+              void fetchAuth();
+            }, 2000);
+          }
+        }, 1000);
+      }
+    };
+
+    void initAuth();
 
     void ytmClient
       .getSpotifyStatus()
@@ -567,6 +666,7 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
 
     return () => {
       cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
     };
   }, [proxyReady]);
 
@@ -631,16 +731,20 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       .then(([persisted, savedQueue]) => {
         if (cancelled) return;
         if (persisted) {
-          setTracks(persisted.tracks || []);
-          setPlaylists(persisted.playlists?.length ? persisted.playlists : DEFAULT_PLAYLISTS);
+          setTracks((persisted.tracks || []).map(redecorateTrack));
+          setPlaylists(
+            (persisted.playlists?.length ? persisted.playlists : DEFAULT_PLAYLISTS).map(
+              redecoratePlaylist,
+            ),
+          );
           setTags(persisted.tags?.length ? persisted.tags : DEFAULT_TAGS);
           setPlayEvents(persisted.playEvents || []);
           setSearchHistory(persisted.searchHistory || []);
           setPlugins(persisted.plugins || []);
-          setYtSavedAlbums(persisted.ytSavedAlbums || []);
-          setYtFollowedArtists(persisted.ytFollowedArtists || []);
-          setYtUploadedTracks(persisted.ytUploadedTracks || []);
-          setYtHistoryTracks(persisted.ytHistoryTracks || []);
+          setYtSavedAlbums((persisted.ytSavedAlbums || []).map(redecorateBrowseItem));
+          setYtFollowedArtists((persisted.ytFollowedArtists || []).map(redecorateBrowseItem));
+          setYtUploadedTracks((persisted.ytUploadedTracks || []).map(redecorateTrack));
+          setYtHistoryTracks((persisted.ytHistoryTracks || []).map(redecorateTrack));
           if (persisted.lastLibrarySyncAt) {
             setLastLibrarySyncAt(persisted.lastLibrarySyncAt);
           }
@@ -790,55 +894,73 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   // Fetch clean InnerTube Home Feed via ytmClient
   useEffect(() => {
     let cancelled = false;
+    let retryTimer: NodeJS.Timeout | null = null;
     setHomeLoading(true);
 
-    if (!settings.ytMusicEnabled) {
-      setHomeTracks(tracks.slice(0, 24));
-      setHomeSections([]);
-      setHomeChips([]);
-      setHomeSourceLabel('Local Library');
-      setHomeLoading(false);
-      return;
-    }
+    const fetchHome = async (attempt = 0): Promise<void> => {
+      if (cancelled) return;
 
-    ytmClient
-      .getHomeFeed({
-        params: selectedHomeChipParams || undefined,
-        gl: settings.contentRegion || 'US',
-        hl: settings.contentLanguage || 'en',
-      })
-      .then((data) => {
-        if (cancelled) return;
-        setHomeSections(data.sections || []);
-        if (!selectedHomeChipParams && data.chips && data.chips.length > 0) {
-          setHomeChips(data.chips);
-        }
-        setHomeTracks(data.tracks || []);
-        setHomeSourceLabel(
-          ytAuthStatus?.loggedIn ? 'YouTube Music (Personalized)' : 'YouTube Music',
-        );
+      // Wait for both proxy config and auth status to be ready
+      if (!proxyReady || ytAuthStatus === null) {
         setHomeLoading(false);
-      })
-      .catch(() => {
+        return;
+      }
+
+      if (!settings.ytMusicEnabled) {
+        setHomeTracks(tracks.slice(0, 24));
+        setHomeSections([]);
+        setHomeChips([]);
+        setHomeSourceLabel('Local Library');
+        setHomeLoading(false);
+        return;
+      }
+
+      try {
+        const data = await ytmClient.getHomeFeed({
+          params: selectedHomeChipParams || undefined,
+          gl: settings.contentRegion || 'US',
+          hl: settings.contentLanguage || 'en',
+        });
         if (!cancelled) {
+          setHomeSections(data.sections || []);
+          if (!selectedHomeChipParams && data.chips && data.chips.length > 0) {
+            setHomeChips(data.chips);
+          }
+          setHomeTracks(data.tracks || []);
+          setHomeSourceLabel(
+            ytAuthStatus?.loggedIn ? 'YouTube Music (Personalized)' : 'YouTube Music',
+          );
+          setHomeLoading(false);
+        }
+      } catch (err) {
+        if (!cancelled && attempt < 2) {
+          // Retry after a short delay to allow the YTM vault / safeStorage to
+          // finish decrypting on Windows, which can lag behind auth restore.
+          retryTimer = setTimeout(() => {
+            void fetchHome(attempt + 1);
+          }, 2000);
+        } else if (!cancelled) {
           setHomeSections([]);
           setHomeTracks([]);
           setHomeLoading(false);
         }
-      });
+      }
+    };
+
+    void fetchHome();
 
     return () => {
       cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
     };
   }, [
     proxyReady,
+    ytAuthStatus,
     selectedHomeChipParams,
     settings.contentLanguage,
     settings.contentRegion,
     settings.ytMusicEnabled,
     tracks,
-    ytAuthStatus?.accountIndex,
-    ytAuthStatus?.loggedIn,
   ]);
 
   const openYtMusicBrowse = useCallback(
@@ -1887,6 +2009,16 @@ const playTrack = useCallback(
         const name = res.status?.accountName || 'YouTube Music User';
         setYtLoginError(null);
         showToast(`Signed in to YouTube Music as ${name}. Syncing library...`);
+        // Persist auth status to localStorage backup immediately after sign-in.
+        // This ensures the user stays signed in across app restarts even if
+        // safeStorage vault decryption fails on Windows.
+        if (res.status) {
+          try {
+            localStorage.setItem(YT_AUTH_LOCAL_KEY, JSON.stringify(res.status));
+          } catch {
+            // ignore
+          }
+        }
         await syncYtMusicLibraryRef.current?.();
         return { ok: true, message: `Signed in as ${name}` };
       } catch {
@@ -1921,6 +2053,14 @@ const playTrack = useCallback(
           return { ok: false, message: msg };
         }
         setYtAuthStatus(res.status);
+        // Persist auth status to localStorage backup after browser session import.
+        if (res.status) {
+          try {
+            localStorage.setItem(YT_AUTH_LOCAL_KEY, JSON.stringify(res.status));
+          } catch {
+            // ignore
+          }
+        }
         showToast(`Signed in as ${res.status.accountName}. Syncing library...`);
         await syncYtMusicLibraryRef.current?.();
         return { ok: true, message: `Signed in as ${res.status.accountName}` };
@@ -1937,6 +2077,20 @@ const playTrack = useCallback(
     async (accountId: string) => {
       const nextStatus = await ytmClient.switchYtmAccount(accountId);
       setYtAuthStatus(nextStatus);
+      // Persist auth status to localStorage backup after account switch.
+      if (nextStatus.loggedIn) {
+        try {
+          localStorage.setItem(YT_AUTH_LOCAL_KEY, JSON.stringify(nextStatus));
+        } catch {
+          // ignore
+        }
+      } else {
+        try {
+          localStorage.removeItem(YT_AUTH_LOCAL_KEY);
+        } catch {
+          // ignore
+        }
+      }
       showToast(`Switched to ${nextStatus.accountName || 'YouTube Music account'}`);
       await syncYtMusicLibraryRef.current?.();
     },
@@ -1947,6 +2101,12 @@ const playTrack = useCallback(
     async (accountId?: string) => {
       const nextStatus = await ytmClient.logoutYtmAccount(accountId);
       setYtAuthStatus(nextStatus);
+      // Clear localStorage auth backup on sign-out.
+      try {
+        localStorage.removeItem('ririp_c_yt_auth_v1');
+      } catch {
+        // ignore
+      }
       if (!nextStatus.loggedIn) {
         setYtSavedAlbums([]);
         setYtFollowedArtists([]);
@@ -2640,6 +2800,16 @@ const playTrack = useCallback(
   useEffect(() => {
     if (typeof BroadcastChannel === 'undefined') return;
     const ch = new BroadcastChannel(MINI_OVERLAY_CHANNEL);
+
+    // Compute current synced lyric line
+    const parsedLyrics = parseLrcLyrics(activeTrackLyrics.syncedLyrics);
+    const activeLyricIdx = findActiveLyricIndex(
+      parsedLyrics,
+      positionSec * 1000,
+      settings.lyricsOffsetMs,
+    );
+    const activeLyricLine = activeLyricIdx >= 0 ? parsedLyrics[activeLyricIdx]?.text : null;
+
     ch.postMessage({
       type: 'STATE',
       payload: {
@@ -2647,11 +2817,15 @@ const playTrack = useCallback(
         isPlaying,
         positionSec,
         durationSec,
+        repeatMode,
+        shuffleEnabled,
+        volume: settings.volume,
         miniOverlayTheme: settings.miniOverlayTheme,
         sliderStyle: settings.sliderStyle,
         themeSeedColor: settings.themeColor,
         darkMode: settings.darkMode,
         themeSurfaceStyle: settings.themeSurfaceStyle,
+        activeLyricLine,
       },
     });
     return () => ch.close();
@@ -2660,18 +2834,37 @@ const playTrack = useCallback(
     durationSec,
     isPlaying,
     positionSec,
+    repeatMode,
+    shuffleEnabled,
     settings.darkMode,
     settings.miniOverlayTheme,
     settings.sliderStyle,
     settings.themeColor,
     settings.themeSurfaceStyle,
+    settings.volume,
+    activeTrackLyrics.syncedLyrics,
+    settings.lyricsOffsetMs,
   ]);
 
   useEffect(() => {
     if (typeof BroadcastChannel === 'undefined') return;
     const ch = new BroadcastChannel(MINI_OVERLAY_CHANNEL);
-    ch.onmessage = (e: MessageEvent<{ type?: string; action?: string; positionSec?: number }>) => {
+    ch.onmessage = (e: MessageEvent<{
+      type?: string;
+      action?: string;
+      positionSec?: number;
+      volume?: number;
+    }>) => {
       if (e.data?.type === 'REQUEST_STATE') {
+        // Compute current synced lyric line
+        const parsedLyrics = parseLrcLyrics(activeTrackLyrics.syncedLyrics);
+        const activeLyricIdx = findActiveLyricIndex(
+          parsedLyrics,
+          positionSec * 1000,
+          settings.lyricsOffsetMs,
+        );
+        const activeLyricLine = activeLyricIdx >= 0 ? parsedLyrics[activeLyricIdx]?.text : null;
+
         ch.postMessage({
           type: 'STATE',
           payload: {
@@ -2679,11 +2872,15 @@ const playTrack = useCallback(
             isPlaying,
             positionSec,
             durationSec,
+            repeatMode,
+            shuffleEnabled,
+            volume: settings.volume,
             miniOverlayTheme: settings.miniOverlayTheme,
             sliderStyle: settings.sliderStyle,
             themeSeedColor: settings.themeColor,
             darkMode: settings.darkMode,
             themeSurfaceStyle: settings.themeSurfaceStyle,
+            activeLyricLine,
           },
         });
       } else if (e.data?.type === 'CMD') {
@@ -2692,6 +2889,18 @@ const playTrack = useCallback(
         if (e.data.action === 'prev') void prevTrack();
         if (e.data.action === 'seek' && typeof e.data.positionSec === 'number') {
           seekTo(e.data.positionSec);
+        }
+        if (e.data.action === 'shuffle') void toggleShuffle();
+        if (e.data.action === 'repeat') void cycleRepeatMode();
+        if (e.data.action === 'volume' && typeof e.data.volume === 'number') {
+          updateSettings({ volume: e.data.volume });
+        }
+        if (e.data.action === 'like' && currentTrack) {
+          void toggleLike(currentTrack.id, currentTrack);
+        }
+        if (e.data.action === 'lyrics') {
+          void closeMiniPlayer(false);
+          toggleRightPanel('lyrics');
         }
         if (e.data.action === 'open-cinema') {
           closeMiniPlayer(true);
@@ -2707,13 +2916,18 @@ const playTrack = useCallback(
     nextTrack,
     positionSec,
     prevTrack,
+    repeatMode,
     seekTo,
+    shuffleEnabled,
     settings.darkMode,
     settings.miniOverlayTheme,
     settings.sliderStyle,
     settings.themeColor,
     settings.themeSurfaceStyle,
+    settings.volume,
     togglePlayPause,
+    toggleRightPanel,
+    updateSettings,
   ]);
 
   useEffect(() => {
@@ -2793,8 +3007,10 @@ const playTrack = useCallback(
     searchHistory,
     plugins,
     settings,
+    volume: settings.volume,
 
     ytAuthStatus,
+    ytVaultDiagnostic,
     ytAccounts,
     activeYtAccount,
     signingInYtMusic,

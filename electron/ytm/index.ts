@@ -11,7 +11,7 @@ import {
   YTM_PARTITION,
 } from './auth';
 import { configureBotGuardWindowFactory } from './botguard';
-import { configureCredentialStorage, updateSpotifyCredentials } from './credentials';
+import { configureCredentialStorage, getVaultDiagnostic, invalidateVaultCache, updateSpotifyCredentials } from './credentials';
 import {
   browseYtmCollection,
   fetchExploreCharts,
@@ -109,6 +109,13 @@ export function registerYtmIpcHandlers(params: RegisterYtmIpcParams): void {
 
   // ── Auth IPC (YTM + Spotify) ─────────────────────────────────────────────
   ipcMain.handle('auth:ytm:status', () => getYtmAuthStatus());
+
+  ipcMain.handle('auth:ytm:vault-diagnostic', () => getVaultDiagnostic());
+
+  ipcMain.handle('auth:ytm:invalidate-vault-cache', () => {
+    invalidateVaultCache();
+    return { ok: true };
+  });
 
   ipcMain.handle(
     'auth:ytm:login',
