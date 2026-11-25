@@ -1,7 +1,8 @@
 import React, { useEffect, useMemo, useRef } from 'react';
-import { ListMusic, Mic2, Minus, Plus, X } from 'lucide-react';
+import { Languages, ListMusic, Mic2, Minus, Plus, X } from 'lucide-react';
 import { useRiriPlayer } from '../context/RiriPlayerContext';
 import { findActiveLyricIndex, parseLrcLyrics } from '../utils/lyricsParser';
+import { hasNonLatinScript } from '../utils/transliterate';
 import { UpNextQueueView } from './UpNextQueueView';
 
 export const RightContextPanel: React.FC = () => {
@@ -14,6 +15,7 @@ export const RightContextPanel: React.FC = () => {
     settings,
     updateSettings,
     activeTrackLyrics,
+    toggleLyricsLanguage,
     queue,
   } = useRiriPlayer();
 
@@ -22,6 +24,12 @@ export const RightContextPanel: React.FC = () => {
   const parsedLyrics = useMemo(
     () => parseLrcLyrics(activeTrackLyrics.syncedLyrics),
     [activeTrackLyrics.syncedLyrics],
+  );
+
+  const hasAlternateLanguage = Boolean(
+    activeTrackLyrics.hasAlternateLanguage ||
+    (activeTrackLyrics.englishLyrics && activeTrackLyrics.englishLyrics.length > 0) ||
+    hasNonLatinScript(activeTrackLyrics.syncedLyrics || activeTrackLyrics.plainLyrics || '')
   );
 
   const activeLineIdx = useMemo(
@@ -60,6 +68,30 @@ export const RightContextPanel: React.FC = () => {
             <Mic2 className="w-3.5 h-3.5" />
             Lyrics
           </button>
+          {hasAlternateLanguage && (
+            <button
+              type="button"
+              onClick={() => void toggleLyricsLanguage()}
+              aria-label={
+                settings.lyricsLanguage === 'ENGLISH'
+                  ? 'Switch to Native lyrics'
+                  : 'Switch to English lyrics'
+              }
+              title={
+                settings.lyricsLanguage === 'ENGLISH'
+                  ? 'Showing English transliteration. Click for Native.'
+                  : 'Showing Native script. Click for English.'
+              }
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+                settings.lyricsLanguage === 'ENGLISH'
+                  ? 'bg-[var(--md-primary)] text-[var(--md-on-primary)] shadow-sm'
+                  : 'text-[var(--md-on-surface-variant)] hover:text-[var(--md-on-surface)]'
+              }`}
+            >
+              <Languages className="w-3.5 h-3.5" />
+              <span>{settings.lyricsLanguage === 'ENGLISH' ? 'English' : 'Native'}</span>
+            </button>
+          )}
           <button
             type="button"
             onClick={() => setRightPanel('queue')}
@@ -139,6 +171,11 @@ export const RightContextPanel: React.FC = () => {
               parsedLyrics.map((line, i) => {
                 const isActive = i === activeLineIdx;
                 const tr = activeTrackLyrics.translations[i];
+                const displayText =
+                  settings.lyricsLanguage === 'ENGLISH' &&
+                  activeTrackLyrics.englishLyrics?.[i]
+                    ? activeTrackLyrics.englishLyrics[i]
+                    : line.text;
                 return (
                   <button
                     key={`${line.timeMs}-${i}`}
@@ -154,8 +191,8 @@ export const RightContextPanel: React.FC = () => {
                           : 'text-[var(--md-on-surface)]/80 hover:text-[var(--md-on-surface)]'
                     }`}
                   >
-                    <div>{line.text}</div>
-                    {tr && tr.toLowerCase() !== line.text.toLowerCase() && (
+                    <div>{displayText}</div>
+                    {tr && tr.toLowerCase() !== displayText.toLowerCase() && (
                       <div className="text-xs font-normal opacity-75 mt-0.5">{tr}</div>
                     )}
                   </button>
@@ -167,7 +204,11 @@ export const RightContextPanel: React.FC = () => {
                   Plain Lyrics (Unsynced)
                 </div>
                 <pre className="whitespace-pre-wrap font-lyrics text-sm leading-relaxed text-[var(--md-on-surface)]/90">
-                  {activeTrackLyrics.plainLyrics}
+                  {settings.lyricsLanguage === 'ENGLISH' &&
+                  activeTrackLyrics.englishLyrics &&
+                  activeTrackLyrics.englishLyrics.length > 0
+                    ? activeTrackLyrics.englishLyrics.join('\n')
+                    : activeTrackLyrics.plainLyrics}
                 </pre>
               </div>
             ) : (

@@ -35,7 +35,8 @@ export const SeekBarSlider: React.FC<SeekBarSliderProps> = ({
 
   const safeMax = Math.max(1, durationSec || 0);
   const clampedPos = Math.min(Math.max(0, positionSec || 0), safeMax);
-  const pct = durationSec > 0 ? Math.min(100, Math.max(0, (clampedPos / durationSec) * 100)) : 0;
+  const pct =
+    durationSec > 0 ? Math.min(100, Math.max(0, (clampedPos / durationSec) * 100)) : 0;
 
   return (
     <div
@@ -69,22 +70,20 @@ export const SeekBarSlider: React.FC<SeekBarSliderProps> = ({
         <div className="relative w-full h-4 flex items-center pointer-events-none">
           {/* Unplayed flat segment */}
           <div
-            className="absolute right-0 h-[3px] rounded-full"
-            style={{
-              left: `${pct}%`,
-              backgroundColor: trackBgColor,
-            }}
+            className="w-full h-1.5 rounded-full"
+            style={{ backgroundColor: trackBgColor }}
           />
 
-          {/* Played wavy segment */}
+          {/* Played wavy/solid segment */}
           <div
-            className="absolute left-0 top-0 bottom-0 overflow-hidden"
+            className="absolute left-0 top-0 bottom-0 flex items-center overflow-hidden"
             style={{ width: `${pct}%` }}
           >
             {isPlaying ? (
               <svg
-                className="h-full w-[calc(100%+24px)] animate-riri-wave"
-                preserveAspectRatio="none"
+                width="100%"
+                height="16"
+                className="h-4 w-[calc(100%+24px)] shrink-0 animate-riri-wave"
                 aria-hidden="true"
               >
                 <defs>
@@ -98,7 +97,7 @@ export const SeekBarSlider: React.FC<SeekBarSliderProps> = ({
                       d="M 0 8 Q 6 2, 12 8 T 24 8"
                       fill="none"
                       stroke={accentColor}
-                      strokeWidth="2.8"
+                      strokeWidth="3"
                       strokeLinecap="round"
                     />
                   </pattern>
@@ -107,7 +106,7 @@ export const SeekBarSlider: React.FC<SeekBarSliderProps> = ({
               </svg>
             ) : (
               <div
-                className="w-full h-[3px] rounded-full mt-[6.5px]"
+                className="w-full h-1.5 rounded-full"
                 style={{ backgroundColor: accentColor }}
               />
             )}
@@ -115,7 +114,7 @@ export const SeekBarSlider: React.FC<SeekBarSliderProps> = ({
 
           {/* Expressive pill thumb */}
           <span
-            className="absolute top-1/2 -translate-x-1/2 -translate-y-1/2 w-1.5 h-3.5 rounded-full shadow-sm transition-transform group-hover:scale-125"
+            className="absolute top-1/2 -translate-x-1/2 -translate-y-1/2 w-1.5 h-3.5 rounded-full shadow-sm opacity-0 group-hover:opacity-100 transition-all group-hover:scale-110"
             style={{
               left: `${pct}%`,
               backgroundColor: accentColor,
@@ -125,7 +124,7 @@ export const SeekBarSlider: React.FC<SeekBarSliderProps> = ({
       ) : sliderStyle === 'SLIM' ? (
         <div className="relative w-full flex items-center pointer-events-none">
           <div
-            className="w-full h-[2px] group-hover:h-[3px] rounded-full overflow-hidden transition-[height]"
+            className="w-full h-[3px] group-hover:h-1 rounded-full overflow-hidden transition-[height]"
             style={{ backgroundColor: trackBgColor }}
           >
             <div
@@ -137,7 +136,7 @@ export const SeekBarSlider: React.FC<SeekBarSliderProps> = ({
             />
           </div>
           <span
-            className="absolute top-1/2 -translate-x-1/2 -translate-y-1/2 w-2.5 h-2.5 rounded-full opacity-80 group-hover:opacity-100 group-hover:scale-125 shadow-sm transition-all"
+            className="absolute top-1/2 -translate-x-1/2 -translate-y-1/2 w-2.5 h-2.5 rounded-full opacity-0 group-hover:opacity-100 group-hover:scale-110 shadow-sm transition-all"
             style={{
               left: `${pct}%`,
               backgroundColor: accentColor,
@@ -145,7 +144,7 @@ export const SeekBarSlider: React.FC<SeekBarSliderProps> = ({
           />
         </div>
       ) : (
-        /* DEFAULT: Bold Standard Material 3 Bar */
+        /* DEFAULT: Clean Pill Progress Bar */
         <div className="relative w-full flex items-center pointer-events-none">
           <div
             className="w-full h-1.5 rounded-full overflow-hidden"
@@ -160,7 +159,7 @@ export const SeekBarSlider: React.FC<SeekBarSliderProps> = ({
             />
           </div>
           <span
-            className="absolute top-1/2 -translate-x-1/2 -translate-y-1/2 w-3.5 h-3.5 rounded-full shadow transition-transform group-hover:scale-110"
+            className="absolute top-1/2 -translate-x-1/2 -translate-y-1/2 w-3 h-3 rounded-full shadow opacity-0 group-hover:opacity-100 scale-75 group-hover:scale-100 transition-all"
             style={{
               left: `${pct}%`,
               backgroundColor: accentColor,

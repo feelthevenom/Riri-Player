@@ -58,6 +58,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // ArchiveTune-style YouTube Music + Spotify Session IPC (no raw cookies exposed)
   auth: {
     ytmStatus: () => ipcRenderer.invoke('auth:ytm:status'),
+    ytmVaultDiagnostic: () => ipcRenderer.invoke('auth:ytm:vault-diagnostic'),
+    ytmInvalidateVaultCache: () => ipcRenderer.invoke('auth:ytm:invalidate-vault-cache'),
+    ytmResetVault: () => ipcRenderer.invoke('auth:ytm:reset-vault'),
+    ytmReset: () => ipcRenderer.invoke('auth:ytm:reset'),
     ytmLogin: (options) => ipcRenderer.invoke('auth:ytm:login', options),
     ytmCancel: () => ipcRenderer.invoke('auth:ytm:cancel'),
     ytmImportBrowser: (payload) => ipcRenderer.invoke('auth:ytm:import-browser', payload),
@@ -96,6 +100,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   spotify: {
     sync: (payload) => ipcRenderer.invoke('spotify:sync', payload),
+    syncProgress: () => ipcRenderer.invoke('spotify:sync-progress'),
     importPlaylist: (payload) => ipcRenderer.invoke('spotify:import-playlist', payload),
     setSchedule: (schedule) => ipcRenderer.invoke('spotify:set-schedule', schedule),
     dismissUnmatched: (trackId) => ipcRenderer.invoke('spotify:dismiss-unmatched', trackId),

@@ -1,6 +1,7 @@
 import {
   AppSettings,
   EqProfile,
+  LyricsProviderInfo,
   MiniOverlayTheme,
   MoodGenreTile,
   Playlist,
@@ -76,8 +77,8 @@ export const OVERLAY_THEME_CLASSES: Record<
 > = {
   GLASS: {
     container:
-      'bg-zinc-900/65 backdrop-blur-2xl border border-white/20 text-white shadow-[0_24px_48px_rgba(0,0,0,0.45)]',
-    muted: 'text-white/70',
+      'bg-[#18181d]/60 backdrop-blur-[36px] backdrop-saturate-[190%] border border-white/[0.22] text-white shadow-[0_20px_44px_-10px_rgba(0,0,0,0.65),inset_0_1px_0_0_rgba(255,255,255,0.34)]',
+    muted: 'text-white/65',
     label: 'Glass',
   },
   DARK: {
@@ -88,7 +89,7 @@ export const OVERLAY_THEME_CLASSES: Record<
   },
   LIGHT: {
     container:
-      'bg-white/85 backdrop-blur-xl border border-black/10 text-[#1C1618] shadow-2xl',
+      'bg-white/85 backdrop-blur-2xl backdrop-saturate-150 border border-black/10 text-[#1C1618] shadow-[0_20px_44px_-10px_rgba(0,0,0,0.22),inset_0_1px_0_0_rgba(255,255,255,0.8)]',
     muted: 'text-[#57484D]',
     label: 'Light',
   },
@@ -108,6 +109,11 @@ export const OVERLAY_THEME_CLASSES: Record<
     container: '',
     muted: '',
     label: 'Dynamic Accent',
+  },
+  RIRI_GLASS: {
+    container: 'riri-glass text-white',
+    muted: 'text-white/60',
+    label: 'Riri Glass',
   },
 };
 
@@ -316,10 +322,10 @@ export const YTM_LANGUAGES: Array<{ code: string; name: string }> = [
 export const DEFAULT_SETTINGS: AppSettings = {
   darkMode: 'DARK',
   pureBlack: false,
-  themeSurfaceStyle: 'MATERIAL',
+  themeSurfaceStyle: 'GLASS',
   dynamicThemeFromArtwork: true,
   themeColor: DEFAULT_THEME_COLOR,
-  playerBackgroundStyle: 'GRADIENT',
+  playerBackgroundStyle: 'BLUR',
   sliderStyle: 'WAVY',
   playbackSpeed: 1.0,
   preservePitch: true,
@@ -333,6 +339,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   showSyncedLyricsTranslation: false,
   translationLanguage: 'ENGLISH',
   lyricsFontScale: 1.0,
+  lyricsLanguage: 'NATIVE',
+  lyricsProviders: ['lrclib', 'youlyplus', 'kugou', 'ytm'],
   pauseSearchHistory: false,
   pauseListenHistory: false,
   ytMusicEnabled: true,
@@ -347,6 +355,39 @@ export const DEFAULT_SETTINGS: AppSettings = {
   lastFmApiKey: '',
   listenBrainzToken: '',
 };
+
+export const LYRICS_PROVIDERS_CATALOG: LyricsProviderInfo[] = [
+  {
+    id: 'lrclib',
+    name: 'LRCLIB',
+    description: 'Open, crowdsourced synchronized LRC database (Free & Fast)',
+    supportsSynced: true,
+  },
+  {
+    id: 'youlyplus',
+    name: 'YouLy+',
+    description: 'High-precision word & line synchronized lyrics proxy (ArchiveTune)',
+    supportsSynced: true,
+  },
+  {
+    id: 'kugou',
+    name: 'KuGou Music',
+    description: 'Massive Asian (C-Pop/J-Pop/K-Pop) & international synchronized LRC library',
+    supportsSynced: true,
+  },
+  {
+    id: 'simpmusic',
+    name: 'SimpMusic',
+    description: 'Crowd-sourced synchronized lyrics indexed by YouTube Video ID',
+    supportsSynced: true,
+  },
+  {
+    id: 'ytm',
+    name: 'YouTube Music',
+    description: 'Official YouTube Music plain lyrics fallback',
+    supportsSynced: false,
+  },
+];
 
 export const FALLBACK_ARTWORK_DATA_URL =
   'data:image/svg+xml;utf8,' +

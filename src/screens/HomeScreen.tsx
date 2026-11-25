@@ -76,7 +76,9 @@ export const HomeScreen: React.FC = () => {
       const shelfTracks = shelfItems
         .map((s) => s.track)
         .filter((t): t is Track => Boolean(t));
-      void playTrack(item.track, shelfTracks.length > 0 ? shelfTracks : [item.track]);
+      void playTrack(item.track, shelfTracks.length > 0 ? shelfTracks : [item.track], {
+        unlimited: true,
+      });
       return;
     }
     if (item.videoId) {
@@ -264,7 +266,7 @@ export const HomeScreen: React.FC = () => {
                 <div className="min-w-0 flex-1">
                   <button
                     type="button"
-                    onClick={() => void playTrack(track, speedDialTracks)}
+                    onClick={() => void playTrack(track, speedDialTracks, { unlimited: true })}
                     className="font-semibold text-sm truncate block text-left w-full hover:underline cursor-pointer"
                   >
                     {track.title}
@@ -292,7 +294,7 @@ export const HomeScreen: React.FC = () => {
                   </button>
                   <button
                     type="button"
-                    onClick={() => void playTrack(track, speedDialTracks)}
+                    onClick={() => void playTrack(track, speedDialTracks, { unlimited: true })}
                     aria-label={`Play ${track.title}`}
                     className="w-9 h-9 rounded-full bg-[var(--md-primary)] text-[var(--md-on-primary)] flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shrink-0 cursor-pointer shadow-md"
                   >
@@ -452,7 +454,7 @@ export const HomeScreen: React.FC = () => {
               <button
                 key={`recent-${t.id}`}
                 type="button"
-                onClick={() => void playTrack(t, recentTracks)}
+                onClick={() => void playTrack(t, recentTracks, { unlimited: true })}
                 className="at-glass-card group text-left rounded-xl bg-[var(--md-surface-container-low)] hover:bg-[var(--md-surface-container-high)] p-3 border border-[var(--md-outline-variant)]/30 transition-colors cursor-pointer"
               >
                 <div className="aspect-square rounded-lg overflow-hidden mb-2 bg-[var(--md-surface-container)] relative">

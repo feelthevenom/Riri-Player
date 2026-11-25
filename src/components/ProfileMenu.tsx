@@ -24,8 +24,12 @@ export const ProfileMenu: React.FC<ProfileMenuProps> = ({ style, className }) =>
     activeYtAccount,
     ytAccounts,
     signingInYtMusic,
+    ytAccountMutationPending,
     ytLoginError,
+    ytLoginRetryable,
+    ytLoginBlocked,
     clearYtLoginError,
+    retryYtMusicSignIn,
     signInWithYouTubeMusic,
     cancelYtMusicSignIn,
     switchYtAccount,
@@ -95,6 +99,7 @@ export const ProfileMenu: React.FC<ProfileMenuProps> = ({ style, className }) =>
     : 'U';
 
   const isSyncBusy = syncing || Boolean(librarySyncProgress?.inProgress);
+  const isAccountMutationBusy = signingInYtMusic || ytAccountMutationPending;
 
   return (
     <div ref={containerRef} className={`relative ${className || ''}`} style={style}>
@@ -108,7 +113,7 @@ export const ProfileMenu: React.FC<ProfileMenuProps> = ({ style, className }) =>
         }
         className="flex items-center gap-2 pl-1.5 pr-2.5 py-1 rounded-full text-xs font-semibold whitespace-nowrap bg-[var(--md-surface-container-high)]/80 hover:bg-[var(--md-surface-container-highest)] border border-[var(--md-outline-variant)]/40 text-[var(--md-on-surface)] transition-colors cursor-pointer"
       >
-        {signingInYtMusic ? (
+        {isAccountMutationBusy ? (
           <Loader2 className="w-6 h-6 p-1 text-[var(--md-primary)] animate-spin shrink-0" />
         ) : activeYtAccount ? (
           activeYtAccount.avatarUrl && !avatarFailed ? (
@@ -129,8 +134,8 @@ export const ProfileMenu: React.FC<ProfileMenuProps> = ({ style, className }) =>
         )}
 
         <span className="hidden sm:inline max-w-[130px] truncate">
-          {signingInYtMusic
-            ? 'Signing in...'
+          {isAccountMutationBusy
+            ? 'Updating account...'
             : activeYtAccount
               ? activeYtAccount.name
               : 'Sign in'}
@@ -191,11 +196,12 @@ export const ProfileMenu: React.FC<ProfileMenuProps> = ({ style, className }) =>
                       <button
                         key={acct.id}
                         type="button"
+                        disabled={ytAccountMutationPending}
                         onClick={() => {
                           if (!isCurrent) void switchYtAccount(acct.id);
                           setOpen(false);
                         }}
-                        className="w-full flex items-center justify-between px-2 py-1.5 rounded-lg hover:bg-[var(--md-surface-container-highest)] cursor-pointer text-left"
+                        className="w-full flex items-center justify-between px-2 py-1.5 rounded-lg hover:bg-[var(--md-surface-container-highest)] cursor-pointer text-left disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         <span className="truncate font-medium">{acct.name}</span>
                         {isCurrent && <Check className="w-3.5 h-3.5 text-[var(--md-primary)] shrink-0" />}
@@ -227,13 +233,36 @@ export const ProfileMenu: React.FC<ProfileMenuProps> = ({ style, className }) =>
               <button
                 type="button"
                 role="menuitem"
-                disabled={signingInYtMusic}
+                disabled={isAccountMutationBusy}
                 onClick={() => void handleYtMusicSignIn(true)}
                 className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-left font-semibold hover:bg-[var(--md-surface-container-highest)] cursor-pointer disabled:opacity-50"
               >
                 <Plus className="w-4 h-4 text-[var(--md-on-surface-variant)]" />
                 <span>Add another account</span>
               </button>
+
+              {ytLoginError && (
+                <div className="mx-2 my-1.5 rounded-xl border border-red-400/30 bg-red-500/10 p-2.5 space-y-2">
+                  <div className="text-[11px] text-red-300 leading-snug">{ytLoginError}</div>
+                  {!ytLoginBlocked && (
+                    <button
+                      type="button"
+                      disabled={isAccountMutationBusy}
+                      onClick={() => {
+                        if (ytLoginRetryable) {
+                          void retryYtMusicSignIn();
+                        } else {
+                          void handleYtMusicSignIn(true);
+                        }
+                      }}
+                      className="w-full flex items-center justify-center gap-1.5 py-1.5 rounded-lg bg-[var(--md-primary)] text-[var(--md-on-primary)] font-semibold text-[11px] disabled:opacity-50 cursor-pointer"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      <span>{ytLoginRetryable ? 'Try again' : 'Sign in again'}</span>
+                    </button>
+                  )}
+                </div>
+              )}
 
               <button
                 type="button"
@@ -253,8 +282,9 @@ export const ProfileMenu: React.FC<ProfileMenuProps> = ({ style, className }) =>
               <button
                 type="button"
                 role="menuitem"
+                disabled={ytAccountMutationPending}
                 onClick={handleSignOutClick}
-                className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-left font-semibold text-red-400 hover:bg-red-500/15 cursor-pointer"
+                className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-left font-semibold text-red-400 hover:bg-red-500/15 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <LogOut className="w-4 h-4" />
                 <span>Sign out</span>
@@ -273,7 +303,7 @@ export const ProfileMenu: React.FC<ProfileMenuProps> = ({ style, className }) =>
                 type="button"
                 role="menuitem"
                 onClick={() => void handleYtMusicSignIn(false)}
-                disabled={signingInYtMusic}
+                disabled={isAccountMutationBusy}
                 className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-left font-semibold hover:bg-[var(--md-primary-container)]/35 text-[var(--md-on-surface)] cursor-pointer disabled:opacity-60"
               >
                 {signingInYtMusic ? (
@@ -303,15 +333,23 @@ export const ProfileMenu: React.FC<ProfileMenuProps> = ({ style, className }) =>
               {ytLoginError && (
                 <div className="mx-2 my-1.5 rounded-xl border border-red-400/30 bg-red-500/10 p-2.5 space-y-2">
                   <div className="text-[11px] text-red-300 leading-snug">{ytLoginError}</div>
-                  <button
-                    type="button"
-                    disabled={signingInYtMusic}
-                    onClick={() => void handleYtMusicSignIn(true)}
-                    className="w-full flex items-center justify-center gap-1.5 py-1.5 rounded-lg bg-[var(--md-primary)] text-[var(--md-on-primary)] font-semibold text-[11px] disabled:opacity-50 cursor-pointer"
-                  >
-                    <RotateCcw className="w-3.5 h-3.5" />
-                    <span>Try again</span>
-                  </button>
+                  {!ytLoginBlocked && (
+                    <button
+                      type="button"
+                      disabled={isAccountMutationBusy}
+                      onClick={() => {
+                        if (ytLoginRetryable) {
+                          void retryYtMusicSignIn();
+                        } else {
+                          void handleYtMusicSignIn(true);
+                        }
+                      }}
+                      className="w-full flex items-center justify-center gap-1.5 py-1.5 rounded-lg bg-[var(--md-primary)] text-[var(--md-on-primary)] font-semibold text-[11px] disabled:opacity-50 cursor-pointer"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      <span>{ytLoginRetryable ? 'Try again' : 'Sign in again'}</span>
+                    </button>
+                  )}
                 </div>
               )}
 

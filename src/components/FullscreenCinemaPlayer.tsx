@@ -4,6 +4,7 @@ import {
   ChevronDown,
   Clock,
   Heart,
+  Languages,
   ListMusic,
   Mic2,
   Minimize2,
@@ -23,6 +24,7 @@ import {
 } from 'lucide-react';
 import { useRiriPlayer } from '../context/RiriPlayerContext';
 import { findActiveLyricIndex, formatTime, parseLrcLyrics } from '../utils/lyricsParser';
+import { hasNonLatinScript } from '../utils/transliterate';
 import { audioEngine } from '../utils/audioEngine';
 import { FALLBACK_ARTWORK_DATA_URL } from '../data/catalog';
 import { WindowTitleBar } from './WindowTitleBar';
@@ -67,6 +69,7 @@ export const FullscreenCinemaPlayer: React.FC = () => {
     updateSettings,
     dynamicArtworkSecondary,
     activeTrackLyrics,
+    toggleLyricsLanguage,
     navigate,
     showToast,
     queue,
@@ -163,9 +166,29 @@ export const FullscreenCinemaPlayer: React.FC = () => {
   }, [fullscreenPlayer, isAppFullscreen, sleepMenuOpen, setFullscreenPlayer]);
 
   // Lyrics parsing & auto-scroll
+  const hasAlternateLanguage = Boolean(
+    activeTrackLyrics.hasAlternateLanguage ||
+    (activeTrackLyrics.englishLyrics && activeTrackLyrics.englishLyrics.length > 0) ||
+    hasNonLatinScript(activeTrackLyrics.syncedLyrics || activeTrackLyrics.plainLyrics || '')
+  );
+
   const parsedLyrics = useMemo(
-    () => parseLrcLyrics(activeTrackLyrics.syncedLyrics),
-    [activeTrackLyrics.syncedLyrics],
+    () => {
+      if (!activeTrackLyrics.syncedLyrics) return [];
+      const original = parseLrcLyrics(activeTrackLyrics.syncedLyrics);
+      if (
+        settings.lyricsLanguage === 'ENGLISH' &&
+        activeTrackLyrics.englishLyrics &&
+        activeTrackLyrics.englishLyrics.length > 0
+      ) {
+        return original.map((line, idx) => ({
+          ...line,
+          text: activeTrackLyrics.englishLyrics![idx] || line.text,
+        }));
+      }
+      return original;
+    },
+    [activeTrackLyrics.syncedLyrics, activeTrackLyrics.englishLyrics, settings.lyricsLanguage],
   );
   const activeIdx = useMemo(
     () => findActiveLyricIndex(parsedLyrics, positionSec * 1000, settings.lyricsOffsetMs),
@@ -424,6 +447,31 @@ export const FullscreenCinemaPlayer: React.FC = () => {
               </button>
             </div>
 
+            {rightTab === 'LYRICS' && hasAlternateLanguage && (
+              <button
+                type="button"
+                onClick={() => void toggleLyricsLanguage()}
+                aria-label={
+                  settings.lyricsLanguage === 'ENGLISH'
+                    ? 'Switch to original native language lyrics'
+                    : 'Switch to English transliterated lyrics'
+                }
+                title={
+                  settings.lyricsLanguage === 'ENGLISH'
+                    ? 'Currently showing English. Click for Native.'
+                    : 'Currently showing Native. Click for English.'
+                }
+                className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold cursor-pointer transition-colors ${
+                  settings.lyricsLanguage === 'ENGLISH'
+                    ? 'bg-[var(--md-primary)] text-[var(--md-on-primary)] shadow-sm'
+                    : 'bg-white/10 text-white/90 hover:bg-white/20'
+                }`}
+              >
+                <Languages className="w-3.5 h-3.5" />
+                <span>{settings.lyricsLanguage === 'ENGLISH' ? 'English' : 'Native'}</span>
+              </button>
+            )}
+
             {rightTab === 'QUEUE' && queue.length > 1 && (
               <button
                 type="button"
@@ -472,7 +520,11 @@ export const FullscreenCinemaPlayer: React.FC = () => {
                 })
               ) : activeTrackLyrics.plainLyrics ? (
                 <pre className="whitespace-pre-wrap font-lyrics text-lg leading-relaxed opacity-85">
-                  {activeTrackLyrics.plainLyrics}
+                  {settings.lyricsLanguage === 'ENGLISH' &&
+                  activeTrackLyrics.englishLyrics &&
+                  activeTrackLyrics.englishLyrics.length > 0
+                    ? activeTrackLyrics.englishLyrics.join('\n')
+                    : activeTrackLyrics.plainLyrics}
                 </pre>
               ) : (
                 <div className={`text-center text-sm ${mutedFgClass} pt-20`}>

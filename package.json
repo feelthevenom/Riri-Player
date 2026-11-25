@@ -1,6 +1,6 @@
 {
   "name": "riri-player",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "High-performance YouTube Music and local audio player standalone desktop client",
   "author": "Riri Player",
   "main": "electron/main.cjs",
@@ -11,10 +11,10 @@
     "dev:electron": "npm run build:ytm && concurrently -k \"npm run dev\" \"wait-on http://localhost:3000 && electron .\"",
     "build": "vite build",
     "build:ytm": "esbuild electron/ytm/index.ts --bundle --platform=node --format=cjs --outfile=electron/ytm-main.cjs --external:electron",
-    "build:server": "esbuild server.ts --bundle --platform=node --format=cjs --outfile=electron/server.cjs --external:vite",
+    "build:server": "esbuild server.ts --bundle --platform=node --format=cjs --outfile=electron/server.cjs --external:vite --external:electron",
     "build:all": "npm run build && npm run build:ytm && npm run build:server",
     "start": "NODE_ENV=production tsx server.ts",
-    "test": "tsx --test src/utils/*.test.ts && node --test electron/*.test.cjs",
+    "test": "tsx --test src/utils/*.test.ts electron/ytm/*.test.ts && node --test electron/*.test.cjs",
     "lint": "tsc --noEmit",
     "verify:release": "node scripts/verify-release-metadata.cjs",
     "dist:win": "npm run build:all && electron-builder --win --publish never"

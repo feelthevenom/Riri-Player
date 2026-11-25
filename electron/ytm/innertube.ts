@@ -14,7 +14,9 @@ import {
 import {
   getActiveYtAccount,
   getAnonymousVisitorData,
+  getYtAccountById,
   setAnonymousVisitorData,
+  type StoredYtAccount,
 } from './credentials';
 
 let evalConfigured = false;
@@ -127,7 +129,9 @@ export async function getInnertubeClient(opts?: {
       )
       .then((yt) => {
         const vd = yt.session.context.client.visitorData;
-        if (vd && vd.startsWith('Cg')) setAnonymousVisitorData(vd);
+        if (vd && vd.startsWith('Cg')) {
+          void setAnonymousVisitorData(vd).catch(() => undefined);
+        }
         return yt;
       });
   }
@@ -139,8 +143,10 @@ export function resetInnertubeClientCache(): void {
   anonymousInnertubePromise = null;
 }
 
-let refreshCookieCallback: (() => Promise<boolean>) | null = null;
-export function registerCookieRefreshCallback(fn: () => Promise<boolean>): void {
+let refreshCookieCallback: ((expectedAccountId?: string) => Promise<boolean>) | null = null;
+export function registerCookieRefreshCallback(
+  fn: ((expectedAccountId?: string) => Promise<boolean>) | null,
+): void {
   refreshCookieCallback = fn;
 }
 
@@ -177,13 +183,13 @@ export async function ensureVisitorData(forceRefresh = false): Promise<string> {
 
   const fromYtm = await fetchVisitorDataFromSwJs('https://music.youtube.com/sw.js_data');
   if (fromYtm) {
-    setAnonymousVisitorData(fromYtm);
+    await setAnonymousVisitorData(fromYtm).catch(() => undefined);
     return fromYtm;
   }
 
   const fromYt = await fetchVisitorDataFromSwJs('https://www.youtube.com/sw.js_data');
   if (fromYt) {
-    setAnonymousVisitorData(fromYt);
+    await setAnonymousVisitorData(fromYt).catch(() => undefined);
     return fromYt;
   }
 
@@ -194,7 +200,7 @@ export async function ensureVisitorData(forceRefresh = false): Promise<string> {
     });
     const vd = yt.session.context.client.visitorData;
     if (vd) {
-      setAnonymousVisitorData(vd);
+      await setAnonymousVisitorData(vd).catch(() => undefined);
       return vd;
     }
   } catch {
@@ -202,6 +208,13 @@ export async function ensureVisitorData(forceRefresh = false): Promise<string> {
   }
 
   return existing || Utils.generateRandomString(11);
+}
+
+export class InnerTubeAuthenticationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InnerTubeAuthenticationError';
+  }
 }
 
 export interface InnerTubeRequestOptions {
@@ -215,6 +228,12 @@ export interface InnerTubeRequestOptions {
   disablePoToken?: boolean;
   visitorDataOverride?: string;
   retryOnAuthError?: boolean;
+  requireAuth?: boolean;
+  /**
+   * Use one immutable account snapshot for an entire operation. This prevents
+   * a mid-request account switch from mixing credentials from two accounts.
+   */
+  accountOverride?: StoredYtAccount;
 }
 
 export async function innerTubePost<T = Record<string, unknown>>(
@@ -223,10 +242,18 @@ export async function innerTubePost<T = Record<string, unknown>>(
   const profile: YouTubeClientProfile =
     YOUTUBE_CLIENTS[opts.clientKey || 'WEB_REMIX'] || YOUTUBE_CLIENTS.WEB_REMIX;
 
-  const rawActive = opts.useAuth !== false ? await getActiveYtAccount() : null;
+  const rawActive =
+    opts.useAuth !== false
+      ? opts.accountOverride || (await getActiveYtAccount())
+      : null;
   const active = rawActive && hasYouTubeLoginCookie(rawActive.cookie) ? rawActive : null;
+  if (opts.requireAuth && !active) {
+    throw new Error('YouTube Music authentication is required for this request.');
+  }
   const visitorData =
-    opts.visitorDataOverride || active?.visitorData || (await ensureVisitorData());
+    opts.visitorDataOverride ||
+    active?.visitorData ||
+    (opts.accountOverride ? '' : await ensureVisitorData());
 
   const effectivePoToken = opts.disablePoToken
     ? undefined
@@ -287,15 +314,34 @@ export async function innerTubePost<T = Record<string, unknown>>(
     opts.retryOnAuthError !== false &&
     refreshCookieCallback
   ) {
-    const refreshed = await refreshCookieCallback().catch(() => false);
+    const refreshed = await refreshCookieCallback(active.id);
     if (refreshed) {
-      return await innerTubePost<T>({ ...opts, retryOnAuthError: false });
+      // Re-read only the account that was refreshed. If the user switched
+      // accounts in the meantime, the refresh callback rejects the update and
+      // this request fails instead of silently using another account.
+      const refreshedAccount = await getYtAccountById(active.id);
+      if (!refreshedAccount) {
+        throw new InnerTubeAuthenticationError(
+          `InnerTube ${opts.endpoint} authentication failed because account ${active.id} was removed during the credential refresh.`,
+        );
+      }
+      return await innerTubePost<T>({
+        ...opts,
+        accountOverride: refreshedAccount,
+        retryOnAuthError: false,
+      });
     }
   }
 
   if (!res.ok) {
     if ((res.status === 401 || res.status === 403) && active && opts.useAuth !== false) {
-      return await innerTubePost<T>({ ...opts, useAuth: false, disablePoToken: true });
+      if (!opts.requireAuth) {
+        return await innerTubePost<T>({ ...opts, useAuth: false, disablePoToken: true });
+      }
+      const authErrorText = await res.text().catch(() => '');
+      throw new Error(
+        `InnerTube ${opts.endpoint} authentication failed (${res.status}): ${authErrorText.slice(0, 180)}`,
+      );
     }
     const errText = await res.text().catch(() => '');
     throw new Error(`InnerTube ${opts.endpoint} failed (${res.status}): ${errText.slice(0, 180)}`);

@@ -32,6 +32,54 @@ const FILTERS: Array<{ id: LibraryFilter; label: string }> = [
 
 type PlaylistSourceFilter = 'ALL' | 'YTMUSIC' | 'SPOTIFY' | 'LIKED' | 'LOCAL';
 
+interface PlaylistCardProps {
+  pl: Playlist;
+  coverUrl: string | null;
+  onClick: () => void;
+}
+
+const PlaylistCard: React.FC<PlaylistCardProps> = ({ pl, coverUrl, onClick }) => {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="at-glass-card text-left rounded-2xl border border-[var(--md-outline-variant)]/40 bg-[var(--md-surface-container)] hover:bg-[var(--md-surface-container-high)] p-4 transition-colors cursor-pointer"
+    >
+      <div className="aspect-video rounded-xl overflow-hidden mb-3 bg-[var(--md-surface-container-low)] flex items-center justify-center">
+        {coverUrl ? (
+          <img
+            src={coverUrl}
+            alt={pl.name}
+            referrerPolicy="no-referrer"
+            onError={(e) => {
+              e.currentTarget.src = FALLBACK_ARTWORK_DATA_URL;
+            }}
+            className="w-full h-full object-cover"
+          />
+        ) : (
+          <ListMusic className="w-8 h-8 text-[var(--md-primary)] opacity-60" />
+        )}
+      </div>
+      <div className="font-bold text-sm truncate">{pl.name}</div>
+      <div className="text-xs text-[var(--md-on-surface-variant)] mt-0.5 flex items-center gap-1.5">
+        <span>{pl.trackIds.length} track(s)</span>
+        {pl.ytBrowseId && (
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-[var(--md-primary)]/20 text-[var(--md-primary)]">YT Music</span>
+        )}
+        {pl.spotifyId && (
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-[#1DB954]/20 text-[#1DB954]">Spotify</span>
+        )}
+        {pl.id === 'pl-liked' && !pl.ytBrowseId && !pl.spotifyId && (
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-[var(--md-primary)]/20 text-[var(--md-primary)]">Liked</span>
+        )}
+        {!pl.ytBrowseId && !pl.spotifyId && pl.id !== 'pl-liked' && (
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-[var(--md-outline-variant)]/30 text-[var(--md-on-surface-variant)]">Local</span>
+        )}
+      </div>
+    </button>
+  );
+};
+
 export const LibraryScreen: React.FC = () => {
   const {
     libraryFilter,
@@ -48,7 +96,11 @@ export const LibraryScreen: React.FC = () => {
     signOutYtAccount,
     signInWithYouTubeMusic,
     signingInYtMusic,
+    ytAccountMutationPending,
     ytLoginError,
+    ytLoginRetryable,
+    ytLoginBlocked,
+    retryYtMusicSignIn,
     ytSavedAlbums,
     ytFollowedArtists,
     ytUploadedTracks,
@@ -66,6 +118,7 @@ export const LibraryScreen: React.FC = () => {
   const [syncing, setSyncing] = useState(false);
   const [playlistSourceFilter, setPlaylistSourceFilter] = useState<PlaylistSourceFilter>('ALL');
   const [playlistCovers, setPlaylistCovers] = useState<Record<string, string>>({});
+  const ytAccountMutationBusy = signingInYtMusic || ytAccountMutationPending;
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const localTracks = useMemo(
@@ -80,6 +133,16 @@ export const LibraryScreen: React.FC = () => {
 
   const ytCloudPlaylists = useMemo(
     () => playlists.filter((p) => Boolean(p.ytBrowseId)),
+    [playlists],
+  );
+
+  const spotifyPlaylists = useMemo(
+    () => playlists.filter((p) => Boolean(p.spotifyId)),
+    [playlists],
+  );
+
+  const ririPlaylists = useMemo(
+    () => playlists.filter((p) => !p.ytBrowseId && !p.spotifyId),
     [playlists],
   );
 
@@ -367,8 +430,9 @@ export const LibraryScreen: React.FC = () => {
                   </button>
                   <button
                     type="button"
+                    disabled={ytAccountMutationPending}
                     onClick={() => void signOutYtAccount(activeYtAccount.id)}
-                    className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold bg-red-500/15 text-red-400 hover:bg-red-500/25 whitespace-nowrap cursor-pointer"
+                    className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold bg-red-500/15 text-red-400 hover:bg-red-500/25 whitespace-nowrap cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
                   >
                     <LogOut className="w-3.5 h-3.5" />
                     <span>Sign out</span>
@@ -378,7 +442,7 @@ export const LibraryScreen: React.FC = () => {
                 <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="button"
-                    disabled={signingInYtMusic}
+                    disabled={ytAccountMutationBusy}
                     onClick={() => void signInWithYouTubeMusic()}
                     className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold bg-[var(--md-primary)] text-[var(--md-on-primary)] whitespace-nowrap cursor-pointer disabled:opacity-50"
                   >
@@ -393,21 +457,33 @@ export const LibraryScreen: React.FC = () => {
                         : 'Sign in to YouTube Music'}
                     </span>
                   </button>
-                  {ytLoginError && (
-                    <button
-                      type="button"
-                      disabled={signingInYtMusic}
-                      onClick={() => void signInWithYouTubeMusic({ cleanPartition: true })}
-                      className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold bg-[var(--md-surface-container-high)] hover:bg-[var(--md-surface-container-highest)] whitespace-nowrap cursor-pointer disabled:opacity-50"
-                    >
-                      <RotateCcw className="w-3.5 h-3.5 text-[var(--md-primary)]" />
-                      <span>Try again</span>
-                    </button>
+                  {ytLoginError && !ytLoginBlocked && (
+                      <button
+                        type="button"
+                        disabled={ytAccountMutationBusy}
+                        onClick={() => {
+                          if (ytLoginRetryable) {
+                            void retryYtMusicSignIn();
+                          } else {
+                            void signInWithYouTubeMusic({ cleanPartition: true });
+                          }
+                        }}
+                        className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold bg-[var(--md-surface-container-high)] hover:bg-[var(--md-surface-container-highest)] whitespace-nowrap cursor-pointer disabled:opacity-50"
+                      >
+                        <RotateCcw className="w-3.5 h-3.5 text-[var(--md-primary)]" />
+                        <span>{ytLoginRetryable ? 'Try again' : 'Sign in again'}</span>
+                      </button>
                   )}
                 </div>
               )}
             </div>
           </div>
+
+          {ytLoginError && (
+            <div className="rounded-xl border border-red-400/30 bg-red-500/10 p-3 text-xs text-red-300">
+              {ytLoginError}
+            </div>
+          )}
 
           {ytCloudPlaylists.length > 0 && (
             <section className="space-y-3">
@@ -599,51 +675,91 @@ export const LibraryScreen: React.FC = () => {
             </div>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-            {visiblePlaylists.map((pl) => {
-              const coverUrl = getPlaylistCover(pl);
-              return (
-                <button
-                  key={pl.id}
-                  type="button"
-                  onClick={() => navigate('playlist', pl.id)}
-                  className="at-glass-card text-left rounded-2xl border border-[var(--md-outline-variant)]/40 bg-[var(--md-surface-container)] hover:bg-[var(--md-surface-container-high)] p-4 transition-colors cursor-pointer"
-                >
-                  <div className="aspect-video rounded-xl overflow-hidden mb-3 bg-[var(--md-surface-container-low)] flex items-center justify-center">
-                    {coverUrl ? (
-                      <img
-                        src={coverUrl}
-                        alt={pl.name}
-                        referrerPolicy="no-referrer"
-                        onError={(e) => {
-                          e.currentTarget.src = FALLBACK_ARTWORK_DATA_URL;
-                        }}
-                        className="w-full h-full object-cover"
+          {playlistSourceFilter === 'ALL' ? (
+            <>
+              {/* YouTube Music section */}
+              {ytCloudPlaylists.length > 0 && (
+                <div className="space-y-3">
+                  <h2 className="text-base font-bold flex items-center gap-2">
+                    <span className="text-[var(--md-primary)]">▶</span>
+                    <span>YouTube Music</span>
+                  </h2>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                    {ytCloudPlaylists.map((pl) => (
+                      <PlaylistCard
+                        key={pl.id}
+                        pl={pl}
+                        coverUrl={getPlaylistCover(pl)}
+                        onClick={() => navigate('playlist', pl.id)}
                       />
-                    ) : (
-                      <ListMusic className="w-8 h-8 text-[var(--md-primary)] opacity-60" />
-                    )}
+                    ))}
                   </div>
-                  <div className="font-bold text-sm truncate">{pl.name}</div>
-                  <div className="text-xs text-[var(--md-on-surface-variant)] mt-0.5 flex items-center gap-1.5">
-                    <span>{pl.trackIds.length} track(s)</span>
-                    {pl.ytBrowseId && (
-                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-[var(--md-primary)]/20 text-[var(--md-primary)]">YT Music</span>
-                    )}
-                    {pl.spotifyId && (
-                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-[#1DB954]/20 text-[#1DB954]">Spotify</span>
-                    )}
-                    {pl.id === 'pl-liked' && !pl.ytBrowseId && !pl.spotifyId && (
-                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-[var(--md-primary)]/20 text-[var(--md-primary)]">Liked</span>
-                    )}
-                    {!pl.ytBrowseId && !pl.spotifyId && pl.id !== 'pl-liked' && (
-                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-[var(--md-outline-variant)]/30 text-[var(--md-on-surface-variant)]">Local</span>
-                    )}
+                </div>
+              )}
+
+              {/* Spotify Music section */}
+              {spotifyPlaylists.length > 0 && (
+                <div className="space-y-3">
+                  <h2 className="text-base font-bold flex items-center gap-2">
+                    <span className="text-[#1DB954]">▶</span>
+                    <span>Spotify Music</span>
+                  </h2>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                    {spotifyPlaylists.map((pl) => (
+                      <PlaylistCard
+                        key={pl.id}
+                        pl={pl}
+                        coverUrl={getPlaylistCover(pl)}
+                        onClick={() => navigate('playlist', pl.id)}
+                      />
+                    ))}
                   </div>
-                </button>
-              );
-            })}
-          </div>
+                </div>
+              )}
+
+              {/* Riri Player section: Liked + local playlists */}
+              {ririPlaylists.length > 0 && (
+                <div className="space-y-3">
+                  <h2 className="text-base font-bold flex items-center gap-2">
+                    <ListMusic className="w-4 h-4 text-[var(--md-primary)]" />
+                    <span>Riri Player</span>
+                  </h2>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                    {ririPlaylists.map((pl) => (
+                      <PlaylistCard
+                        key={pl.id}
+                        pl={pl}
+                        coverUrl={getPlaylistCover(pl)}
+                        onClick={() => navigate('playlist', pl.id)}
+                      />
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {ytCloudPlaylists.length === 0 && spotifyPlaylists.length === 0 && ririPlaylists.length === 0 && (
+                <div className="at-glass-card rounded-2xl border border-[var(--md-outline-variant)]/40 bg-[var(--md-surface-container-low)] p-8 text-center text-xs text-[var(--md-on-surface-variant)]">
+                  No playlists yet. Create a new playlist or sync from YouTube Music / Spotify.
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+              {visiblePlaylists.map((pl) => (
+                <PlaylistCard
+                  key={pl.id}
+                  pl={pl}
+                  coverUrl={getPlaylistCover(pl)}
+                  onClick={() => navigate('playlist', pl.id)}
+                />
+              ))}
+              {visiblePlaylists.length === 0 && (
+                <div className="col-span-full at-glass-card rounded-2xl border border-[var(--md-outline-variant)]/40 bg-[var(--md-surface-container-low)] p-8 text-center text-xs text-[var(--md-on-surface-variant)]">
+                  No playlists in this source.
+                </div>
+              )}
+            </div>
+          )}
         </section>
       )}
 

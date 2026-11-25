@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { appendUniqueQueueSuggestions, replaceUpcomingQueueWithRadio } from './queueHelpers';
+import {
+  appendUniqueQueueSuggestions,
+  replaceUpcomingQueueWithRadio,
+  shouldUseUnlimitedQueue,
+} from './queueHelpers';
 import { Track } from '../types/music';
 
 const makeTrack = (id: string, ytMusicVideoId?: string): Track => ({
@@ -42,4 +46,13 @@ test('replaceUpcomingQueueWithRadio keeps tracks up to activeIndex and replaces 
     result.map((t) => t.id),
     ['ytm-1', 'ytm-2', 'ytm-new1', 'ytm-new2'],
   );
+});
+
+test('shouldUseUnlimitedQueue bounds playlist/library queues and allows unlimited for non-playlist tracks', () => {
+  assert.equal(shouldUseUnlimitedQueue(true), false);
+  assert.equal(shouldUseUnlimitedQueue(false), true);
+  assert.equal(shouldUseUnlimitedQueue(true, { unlimited: true }), true);
+  assert.equal(shouldUseUnlimitedQueue(false, { unlimited: false }), false);
+  assert.equal(shouldUseUnlimitedQueue(true, { preserveQueueMode: true }, false), false);
+  assert.equal(shouldUseUnlimitedQueue(true, { preserveQueueMode: true }, true), true);
 });

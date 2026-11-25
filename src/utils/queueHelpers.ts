@@ -23,6 +23,26 @@ export function appendUniqueQueueSuggestions(existingQueue: Track[], incoming: T
   return [...existingQueue, ...additions];
 }
 
+export interface PlayQueueModeOptions {
+  unlimited?: boolean;
+  preserveQueueMode?: boolean;
+}
+
+/**
+ * Determines whether playback should use unlimited YouTube Music radio suggestions
+ * (true for non-playlist/non-library single-track or home-shelf playback) or stay
+ * strictly bounded to the selected playlist/library queue (false).
+ */
+export function shouldUseUnlimitedQueue(
+  hasExplicitQueue: boolean,
+  options?: PlayQueueModeOptions,
+  currentUnlimited = true,
+): boolean {
+  if (options?.preserveQueueMode) return currentUnlimited;
+  if (typeof options?.unlimited === 'boolean') return options.unlimited;
+  return !hasExplicitQueue;
+}
+
 /**
  * Replaces the upcoming portion of the queue after `activeIndex` with newly filtered radio tracks
  * (used when selecting a YT Music Queue Chip like "Familiar" or "Discover").

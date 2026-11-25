@@ -140,3 +140,69 @@ html.mini-overlay-active #root {
   }
 }
 
+/* ── Riri Glass mini-player theme (reference: Glassmorphism_Riri_Music_Player.png) ──
+   Colors are applied inline via --riri-glass-primary / --riri-glass-secondary CSS vars
+   derived from the album artwork palette. ── */
+.riri-glass {
+  position: relative;
+  border-radius: 28px;
+  background:
+    radial-gradient(120% 90% at 0% 100%, rgba(var(--riri-glass-primary-r, 237), var(--riri-glass-primary-g, 85), var(--riri-glass-primary-b, 100), 0.35), transparent 55%),
+    radial-gradient(80% 90% at 100% 60%, rgba(var(--riri-glass-secondary-r, 120), var(--riri-glass-secondary-g, 130), var(--riri-glass-secondary-b, 240), 0.30), transparent 60%),
+    linear-gradient(135deg, rgba(48, 40, 46, 0.55), rgba(28, 26, 34, 0.55));
+  backdrop-filter: blur(40px) saturate(180%);
+  -webkit-backdrop-filter: blur(40px) saturate(180%);
+  box-shadow:
+    0 24px 60px -12px rgba(0, 0, 0, 0.6),
+    inset 0 1px 0 rgba(255, 255, 255, 0.35),
+    inset 0 0 40px rgba(255, 255, 255, 0.04);
+}
+
+/* Gradient rim via ::before + mask-composite */
+.riri-glass::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1.5px;
+  background: linear-gradient(135deg, rgba(var(--riri-glass-primary-r, 255), var(--riri-glass-primary-g, 111), var(--riri-glass-primary-b, 127), 1), rgba(255, 255, 255, 0.35) 40%, rgba(255, 255, 255, 0.2) 60%, rgba(var(--riri-glass-secondary-r, 143), var(--riri-glass-secondary-g, 152), var(--riri-glass-secondary-b, 245), 1));
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+}
+
+.riri-play {
+  background: linear-gradient(135deg, #FF5A6E, #ED2F5B);
+  box-shadow: 0 0 28px rgba(237, 85, 100, 0.65), inset 0 1px 0 rgba(255, 255, 255, 0.4);
+}
+
+.riri-range {
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.riri-range-fill {
+  background: linear-gradient(90deg, #FF6F7F, #ED5564);
+}
+
+.riri-thumb {
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: #FF6F9A;
+  box-shadow: 0 0 10px rgba(237, 85, 100, 0.7);
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .riri-glass {
+    background: rgba(28, 26, 34, 0.92);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+  .riri-glass::before {
+    display: none;
+  }
+}
+

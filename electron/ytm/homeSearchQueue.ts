@@ -13,7 +13,11 @@ import {
   parseInnertubeSearchItems,
   parseInnertubeSearchSuggestions,
   parseInnertubeRichSearchSuggestions,
+  pickBestThumbnailUrl,
 } from '../../src/utils/ytMusicParser';
+import { extractYtMusicContinuation } from '../../src/utils/ytmContinuation';
+import { getActiveYtAccount } from './credentials';
+import { hasYouTubeLoginCookie } from './clients';
 import { innerTubePost } from './innertube';
 
 // ArchiveTune InnerTube Search Filter Params
@@ -33,26 +37,12 @@ function toTrack(t: NormalizedYtTrack): Track {
   };
 }
 
-function extractContinuationToken(json: unknown): string | undefined {
-  if (!json || typeof json !== 'object') return undefined;
-  let token: string | undefined;
-  const walk = (node: unknown, depth = 0) => {
-    if (token || !node || typeof node !== 'object' || depth > 12) return;
-    if (Array.isArray(node)) {
-      for (const item of node) walk(item, depth + 1);
-      return;
-    }
-    const obj = node as Record<string, unknown>;
-    if (typeof obj.continuation === 'string' && obj.continuation.length > 8) {
-      token = obj.continuation;
-      return;
-    }
-    for (const val of Object.values(obj)) {
-      if (val && typeof val === 'object') walk(val, depth + 1);
-    }
-  };
-  walk(json, 0);
-  return token;
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  const error = new Error('YouTube Music request aborted');
+  error.name = 'AbortError';
+  throw error;
 }
 
 function extractWatchTabBrowseIds(json: unknown): {
@@ -108,15 +98,19 @@ export async function fetchHomeFeed(opts: {
         ...(opts.params ? { params: opts.params } : {}),
       };
 
+  const active = await getActiveYtAccount();
+  const requireAuth = Boolean(active && hasYouTubeLoginCookie(active.cookie));
   const json = await innerTubePost({
     endpoint: 'browse',
     body,
     gl: opts.gl || 'US',
     hl: opts.hl || 'en',
+    requireAuth,
+    accountOverride: active || undefined,
   });
 
   const parsed = parseInnertubeHomeFeed(json);
-  const continuation = extractContinuationToken(json);
+  const continuation = extractYtMusicContinuation(json);
 
   return {
     sections: parsed.sections.map((sec) => ({
@@ -192,6 +186,144 @@ export async function fetchExploreCharts(opts: {
   return { tracks, sections };
 }
 
+function readRendererText(value: unknown): string {
+  if (!value || typeof value !== 'object') return '';
+  const renderer = value as {
+    runs?: Array<{ text?: string }>;
+    simpleText?: string;
+  };
+  if (Array.isArray(renderer.runs)) {
+    return renderer.runs.map((run) => run.text || '').join('').trim();
+  }
+  return (renderer.simpleText || '').trim();
+}
+
+function findCollectionHeader(json: unknown): Record<string, unknown> | undefined {
+  const root = json && typeof json === 'object' ? (json as Record<string, unknown>) : {};
+  const topHeader = (root.header as Record<string, unknown> | undefined) || {};
+
+  const preferred =
+    (topHeader.musicDetailHeaderRenderer as Record<string, unknown> | undefined) ||
+    (topHeader.musicResponsiveHeaderRenderer as Record<string, unknown> | undefined) ||
+    (topHeader.musicImmersiveHeaderRenderer as Record<string, unknown> | undefined) ||
+    (
+      topHeader.musicEditablePlaylistDetailHeaderRenderer as
+        | { header?: { musicResponsiveHeaderRenderer?: Record<string, unknown> } }
+        | undefined
+    )?.header?.musicResponsiveHeaderRenderer;
+  if (preferred) return preferred;
+
+  let found: Record<string, unknown> | undefined;
+  const walk = (node: unknown, depth = 0): void => {
+    if (found || !node || typeof node !== 'object' || depth > 18) return;
+    if (Array.isArray(node)) {
+      for (const element of node) walk(element, depth + 1);
+      return;
+    }
+    const obj = node as Record<string, unknown>;
+    const candidate =
+      (obj.musicDetailHeaderRenderer as Record<string, unknown> | undefined) ||
+      (obj.musicResponsiveHeaderRenderer as Record<string, unknown> | undefined) ||
+      (obj.musicImmersiveHeaderRenderer as Record<string, unknown> | undefined) ||
+      (
+        obj.musicEditablePlaylistDetailHeaderRenderer as
+          | { header?: { musicResponsiveHeaderRenderer?: Record<string, unknown> } }
+          | undefined
+      )?.header?.musicResponsiveHeaderRenderer;
+    if (candidate) {
+      found = candidate;
+      return;
+    }
+    for (const value of Object.values(obj)) {
+      if (value && typeof value === 'object') walk(value, depth + 1);
+    }
+  };
+  walk(json, 0);
+  return found;
+}
+
+function getCollectionHeaderThumbnail(header: Record<string, unknown> | undefined): string {
+  if (!header) return '';
+  const thumbnail = header.thumbnail as Record<string, unknown> | undefined;
+  const renderer =
+    (thumbnail?.croppedSquareThumbnailRenderer as Record<string, unknown> | undefined) ||
+    (thumbnail?.musicThumbnailRenderer as Record<string, unknown> | undefined) ||
+    thumbnail;
+  if (!renderer) return '';
+  const thumbs =
+    (renderer.thumbnail as { thumbnails?: Array<{ url?: string; width?: number; height?: number }> } | undefined)?.thumbnails ||
+    (renderer.thumbnails as Array<{ url?: string; width?: number; height?: number }> | undefined) ||
+    [];
+  const rawThumb = pickBestThumbnailUrl(thumbs);
+  return rawThumb ? `/api/proxy-image?url=${encodeURIComponent(rawThumb)}` : '';
+}
+
+export function parseYtmCollectionResponse(
+  json: unknown,
+  browseId: string,
+): {
+  browseId: string;
+  title: string;
+  subtitle: string;
+  thumbnailUrl: string;
+  tracks: Track[];
+  items: YtMusicBrowseItem[];
+  continuation?: string;
+} {
+  const parsedTracks = parseInnertubeSearchItems(json).map(toTrack);
+  const cards = parseInnertubeBrowseCards(json, 'song');
+  const items: YtMusicBrowseItem[] = cards.map((card) => ({
+    ...card,
+    track: card.track ? toTrack(card.track) : undefined,
+  }));
+
+  const detailHeader = findCollectionHeader(json);
+  const title = detailHeader ? readRendererText(detailHeader.title) : '';
+  const subtitle = detailHeader
+    ? readRendererText(detailHeader.subtitle) || readRendererText(detailHeader.straplineTextOne)
+    : '';
+  let thumbnailUrl = getCollectionHeaderThumbnail(detailHeader);
+
+  if (!thumbnailUrl) {
+    const matchingCard = items.find(
+      (item) => item.title.trim().toLowerCase() === title.trim().toLowerCase() && item.thumbnailUrl,
+    );
+    thumbnailUrl = matchingCard?.thumbnailUrl || items.find((item) => item.thumbnailUrl)?.thumbnailUrl || '';
+  }
+
+  const isAlbum = browseId.startsWith('MPRE');
+  const tracks = parsedTracks.map((track) => ({
+    ...track,
+    thumbnailUrl: track.thumbnailUrl || thumbnailUrl,
+    // The collection header is authoritative for album metadata. Individual
+    // rows can expose an artist/other column as a misleading album name.
+    album: isAlbum && title ? title : track.album,
+    albumId: isAlbum ? browseId : track.albumId,
+  }));
+  const collectionItems = items.map((item) => ({
+    ...item,
+    thumbnailUrl: item.thumbnailUrl || thumbnailUrl,
+    track: item.track
+      ? {
+          ...item.track,
+          thumbnailUrl: item.track.thumbnailUrl || thumbnailUrl,
+          album: isAlbum && title ? title : item.track.album,
+          albumId: isAlbum ? browseId : item.track.albumId,
+        }
+      : undefined,
+  }));
+
+  return {
+    browseId,
+    title: title || tracks[0]?.album || 'YouTube Music Collection',
+    subtitle: subtitle || `${tracks.length} tracks`,
+    thumbnailUrl: thumbnailUrl || tracks[0]?.thumbnailUrl || '',
+    tracks,
+    items: collectionItems,
+    continuation: extractYtMusicContinuation(json, { itemShelfOnly: true }),
+  };
+}
+
 export async function browseYtmCollection(opts: {
   browseId: string;
   continuation?: string;
@@ -220,6 +352,8 @@ export async function browseYtmCollection(opts: {
     targetBrowseId = `VL${targetBrowseId}`;
   }
 
+  const active = await getActiveYtAccount();
+  const requireAuth = Boolean(active && hasYouTubeLoginCookie(active.cookie));
   const json = await innerTubePost({
     endpoint: 'browse',
     body: opts.continuation
@@ -227,60 +361,11 @@ export async function browseYtmCollection(opts: {
       : { browseId: targetBrowseId },
     gl: opts.gl || 'US',
     hl: opts.hl || 'en',
+    requireAuth,
+    accountOverride: active || undefined,
   });
 
-  const tracks = parseInnertubeSearchItems(json).map(toTrack);
-  const cards = parseInnertubeBrowseCards(json, 'song');
-  const items: YtMusicBrowseItem[] = cards.map((c) => ({
-    ...c,
-    track: c.track ? toTrack(c.track) : undefined,
-  }));
-
-  let title = '';
-  let subtitle = '';
-  let thumbnailUrl = '';
-
-  const header = (json.header as Record<string, unknown> | undefined) || {};
-  const detailHeader =
-    (header.musicDetailHeaderRenderer as Record<string, unknown> | undefined) ||
-    (header.musicResponsiveHeaderRenderer as Record<string, unknown> | undefined) ||
-    (header.musicImmersiveHeaderRenderer as Record<string, unknown> | undefined) ||
-    (header.musicEditablePlaylistDetailHeaderRenderer as {
-      header?: { musicResponsiveHeaderRenderer?: Record<string, unknown> };
-    } | undefined)?.header?.musicResponsiveHeaderRenderer;
-
-  if (detailHeader) {
-    const titleRuns = (detailHeader.title as { runs?: Array<{ text?: string }> } | undefined)?.runs;
-    title = (titleRuns || []).map((r) => r.text || '').join('').trim();
-    const subRuns = (detailHeader.subtitle as { runs?: Array<{ text?: string }> } | undefined)?.runs;
-    subtitle = (subRuns || []).map((r) => r.text || '').join('').trim();
-    const thumbs =
-      (
-        (detailHeader.thumbnail as Record<string, unknown> | undefined)?.croppedSquareThumbnailRenderer as
-          | { thumbnail?: { thumbnails?: Array<{ url?: string }> } }
-          | undefined
-      )?.thumbnail?.thumbnails ||
-      (
-        (detailHeader.thumbnail as Record<string, unknown> | undefined)?.musicThumbnailRenderer as
-          | { thumbnail?: { thumbnails?: Array<{ url?: string }> } }
-          | undefined
-      )?.thumbnail?.thumbnails ||
-      [];
-    const rawThumb = thumbs[thumbs.length - 1]?.url || thumbs[0]?.url || '';
-    if (rawThumb) {
-      thumbnailUrl = `/api/proxy-image?url=${encodeURIComponent(rawThumb)}`;
-    }
-  }
-
-  return {
-    browseId: targetBrowseId,
-    title: title || tracks[0]?.album || 'YouTube Music Collection',
-    subtitle: subtitle || `${tracks.length} tracks`,
-    thumbnailUrl: thumbnailUrl || tracks[0]?.thumbnailUrl || '',
-    tracks,
-    items,
-    continuation: extractContinuationToken(json),
-  };
+  return parseYtmCollectionResponse(json, targetBrowseId);
 }
 
 export async function searchYtm(opts: {
@@ -339,7 +424,7 @@ export async function searchYtm(opts: {
   return {
     tracks,
     cards,
-    continuation: extractContinuationToken(json),
+    continuation: extractYtMusicContinuation(json),
   };
 }
 
@@ -377,7 +462,9 @@ export async function fetchNextQueue(opts: {
   continuation?: string;
   gl?: string;
   hl?: string;
+  signal?: AbortSignal;
 }): Promise<YtMusicNextResult | null> {
+  throwIfAborted(opts.signal);
   const body: Record<string, unknown> = opts.continuation
     ? { continuation: opts.continuation }
     : {
@@ -396,6 +483,7 @@ export async function fetchNextQueue(opts: {
     gl: opts.gl || 'US',
     hl: opts.hl || 'en',
   });
+  throwIfAborted(opts.signal);
 
   const parsed = parseInnertubeNext(json);
   if (!parsed) return null;
@@ -407,6 +495,7 @@ export async function fetchNextQueue(opts: {
     currentIndex: parsed.currentIndex,
     continuation: parsed.continuation,
     lyricsBrowseId: tabIds.lyricsBrowseId,
+    sourceVideoId: opts.videoId || parsed.endpoint.watchEndpoint.videoId,
     relatedBrowseId: tabIds.relatedBrowseId,
     endpoint: parsed.endpoint,
     automixEndpoint: parsed.automixEndpoint,
@@ -414,18 +503,44 @@ export async function fetchNextQueue(opts: {
   };
 }
 
+export function selectMatchingLyricsBrowseId(
+  videoId: string,
+  lyricsBrowseId?: string,
+  lyricsBrowseVideoId?: string,
+): string | undefined {
+  if (!lyricsBrowseId) return undefined;
+  return lyricsBrowseVideoId === videoId ? lyricsBrowseId : undefined;
+}
+
 export async function fetchYtmLyrics(opts: {
   videoId: string;
   lyricsBrowseId?: string;
+  lyricsBrowseVideoId?: string;
   gl?: string;
   hl?: string;
+  signal?: AbortSignal;
 }): Promise<{ plainLyrics?: string; source?: string }> {
+  throwIfAborted(opts.signal);
   const gl = opts.gl || 'US';
   const hl = opts.hl || 'en';
-  let browseId = opts.lyricsBrowseId;
+  let browseId = selectMatchingLyricsBrowseId(
+    opts.videoId,
+    opts.lyricsBrowseId,
+    opts.lyricsBrowseVideoId,
+  );
   if (!browseId && opts.videoId) {
-    const nextRes = await fetchNextQueue({ videoId: opts.videoId, gl, hl }).catch(() => null);
-    browseId = nextRes?.lyricsBrowseId;
+    const nextRes = await fetchNextQueue({
+      videoId: opts.videoId,
+      gl,
+      hl,
+      signal: opts.signal,
+    }).catch(() => null);
+    throwIfAborted(opts.signal);
+    browseId = selectMatchingLyricsBrowseId(
+      opts.videoId,
+      nextRes?.lyricsBrowseId,
+      nextRes?.sourceVideoId,
+    );
   }
   if (!browseId) return {};
 
@@ -436,6 +551,7 @@ export async function fetchYtmLyrics(opts: {
       gl,
       hl,
     });
+    throwIfAborted(opts.signal);
     let text = '';
     const walk = (node: unknown, depth = 0) => {
       if (text || !node || typeof node !== 'object' || depth > 14) return;
@@ -457,7 +573,8 @@ export async function fetchYtmLyrics(opts: {
     };
     walk(json, 0);
     return text ? { plainLyrics: text, source: 'YouTube Music' } : {};
-  } catch {
+  } catch (error) {
+    if (opts.signal?.aborted) throw error;
     return {};
   }
 }

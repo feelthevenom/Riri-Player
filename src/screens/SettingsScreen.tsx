@@ -1,18 +1,24 @@
 import React, { useRef, useState } from 'react';
 import {
+  ArrowDown,
+  ArrowUp,
   Check,
   Database,
   Disc3,
   Download,
+  Globe,
+  Languages,
   Loader2,
   LogIn,
   LogOut,
+  Mic,
   Minimize2,
   Monitor,
   Palette,
   RefreshCw,
   RotateCcw,
   Search,
+  Sliders,
   Upload,
   Trash2,
   X,
@@ -24,6 +30,7 @@ import {
 } from 'lucide-react';
 import { useRiriPlayer } from '../context/RiriPlayerContext';
 import {
+  LYRICS_PROVIDERS_CATALOG,
   OVERLAY_THEME_CLASSES,
   THEME_PRESETS,
   YTM_LANGUAGES,
@@ -32,6 +39,7 @@ import {
 import {
   AppSettings,
   DarkModePreference,
+  LyricsProviderId,
   MiniOverlayTheme,
   PlayerBackgroundStyle,
   SliderStyle,
@@ -102,8 +110,14 @@ export const SettingsScreen: React.FC = () => {
     activeYtAccount,
     ytAccounts,
     signingInYtMusic,
+    ytAccountMutationPending,
     ytLoginError,
+    ytLoginRetryable,
+    ytLoginBlocked,
     clearYtLoginError,
+    retryYtMusicSignIn,
+    resetYtVault,
+    ytVaultDiagnostic,
     signInWithYouTubeMusic,
     switchYtAccount,
     signOutYtAccount,
@@ -128,9 +142,59 @@ export const SettingsScreen: React.FC = () => {
   } = useRiriPlayer();
 
   const [restoreMsg, setRestoreMsg] = useState<string | null>(null);
+  const [resettingYtVault, setResettingYtVault] = useState(false);
+  const [resettingAllData, setResettingAllData] = useState(false);
   const [spotifyConnecting, setSpotifyConnecting] = useState(false);
   const [ytSyncing, setYtSyncing] = useState(false);
   const backupFileRef = useRef<HTMLInputElement | null>(null);
+
+  const validLyricsProviderIds = React.useMemo(
+    () => new Set(LYRICS_PROVIDERS_CATALOG.map((provider) => provider.id)),
+    [],
+  );
+  const currentProviders: LyricsProviderId[] = React.useMemo(() => {
+    const stored = Array.isArray(settings.lyricsProviders)
+      ? settings.lyricsProviders
+      : [];
+    const normalized = Array.from(
+      new Set(stored.filter((provider) => validLyricsProviderIds.has(provider))),
+    );
+    return normalized.length > 0 ? normalized : ['lrclib'];
+  }, [settings.lyricsProviders, validLyricsProviderIds]);
+
+  React.useEffect(() => {
+    if (
+      Array.isArray(settings.lyricsProviders) &&
+      settings.lyricsProviders.length === currentProviders.length &&
+      settings.lyricsProviders.every((provider, index) => provider === currentProviders[index])
+    ) {
+      return;
+    }
+    updateSettings({ lyricsProviders: currentProviders });
+  }, [currentProviders, settings.lyricsProviders, updateSettings]);
+
+  const toggleLyricsProvider = (id: LyricsProviderId) => {
+    let next: LyricsProviderId[];
+    if (currentProviders.includes(id)) {
+      if (currentProviders.length <= 1) {
+        showToast('At least one lyrics provider must remain active.');
+        return;
+      }
+      next = currentProviders.filter((p) => p !== id);
+    } else {
+      next = [...currentProviders, id];
+    }
+    updateSettings({ lyricsProviders: next });
+  };
+
+  const moveLyricsProvider = (index: number, direction: 'up' | 'down') => {
+    const targetIndex = direction === 'up' ? index - 1 : index + 1;
+    if (targetIndex < 0 || targetIndex >= currentProviders.length) return;
+    const reordered = [...currentProviders];
+    const [moved] = reordered.splice(index, 1);
+    reordered.splice(targetIndex, 0, moved);
+    updateSettings({ lyricsProviders: reordered });
+  };
 
   // Update state
   const [updateStatus, setUpdateStatus] = useState<{
@@ -151,6 +215,22 @@ export const SettingsScreen: React.FC = () => {
   const handleYtmSignIn = async (cleanPartition = false) => {
     clearYtLoginError();
     await signInWithYouTubeMusic(cleanPartition ? { cleanPartition: true } : undefined);
+  };
+
+  const handleResetYtVault = async () => {
+    if (
+      !window.confirm(
+        'Reset the encrypted session vault (including YouTube Music and Spotify credentials)? The unreadable vault will be preserved as a backup file in the Riri Player data folder.',
+      )
+    ) {
+      return;
+    }
+    setResettingYtVault(true);
+    try {
+      await resetYtVault();
+    } finally {
+      setResettingYtVault(false);
+    }
   };
 
   const handleYtmSync = async () => {
@@ -325,6 +405,7 @@ export const SettingsScreen: React.FC = () => {
   }, [showToast]);
 
   const ytmSyncBusy = ytSyncing || Boolean(librarySyncProgress?.inProgress);
+  const ytAccountMutationBusy = signingInYtMusic || ytAccountMutationPending;
 
   return (
     <div className="space-y-8 pb-10 max-w-4xl">
@@ -353,14 +434,43 @@ export const SettingsScreen: React.FC = () => {
           {activeYtAccount && (
             <button
               type="button"
+              disabled={ytAccountMutationPending}
               onClick={() => void signOutYtAccount(activeYtAccount.id)}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold bg-red-500/15 text-red-300 hover:bg-red-500/25 cursor-pointer"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold bg-red-500/15 text-red-300 hover:bg-red-500/25 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
             >
               <LogOut className="w-3.5 h-3.5" />
               <span>Sign out</span>
             </button>
           )}
         </div>
+
+        {ytVaultDiagnostic?.unreadableFile && (
+          <div className="rounded-xl border border-amber-400/30 bg-amber-500/10 p-3 space-y-2">
+            <div className="flex items-start gap-2 text-xs text-amber-200">
+              <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+              <div>
+                <div className="font-semibold">The encrypted session vault could not be read.</div>
+                <div className="mt-1 text-[11px] leading-snug text-amber-200/80 break-words">
+                  {ytVaultDiagnostic.error ||
+                    'Riri Player preserved the existing file and did not treat this as a sign-out.'}
+                </div>
+              </div>
+            </div>
+            <button
+              type="button"
+              disabled={resettingYtVault}
+              onClick={() => void handleResetYtVault()}
+              className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-amber-500/15 hover:bg-amber-500/25 border border-amber-400/30 text-amber-200 text-xs font-semibold cursor-pointer disabled:opacity-60"
+            >
+              {resettingYtVault ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <RotateCcw className="w-3.5 h-3.5" />
+              )}
+              <span>Reset encrypted vault</span>
+            </button>
+          </div>
+        )}
 
         {activeYtAccount ? (
           <div className="space-y-3">
@@ -392,7 +502,7 @@ export const SettingsScreen: React.FC = () => {
               <div className="flex items-center gap-2 shrink-0">
                 <button
                   type="button"
-                  disabled={signingInYtMusic}
+                  disabled={ytAccountMutationBusy}
                   onClick={() => void handleYtmSignIn(true)}
                   className="px-3 py-2 rounded-xl bg-[var(--md-surface-container-high)] hover:bg-[var(--md-surface-container-highest)] text-xs font-semibold cursor-pointer"
                 >
@@ -436,6 +546,29 @@ export const SettingsScreen: React.FC = () => {
               </div>
             )}
 
+            {ytLoginError && (
+              <div className="rounded-xl border border-red-400/30 bg-red-500/10 p-3 space-y-2">
+                <div className="text-xs text-red-300 leading-snug">{ytLoginError}</div>
+                {!ytLoginBlocked && (
+                  <button
+                    type="button"
+                    disabled={ytAccountMutationBusy}
+                    onClick={() => {
+                      if (ytLoginRetryable) {
+                        void retryYtMusicSignIn();
+                      } else {
+                        void handleYtmSignIn(true);
+                      }
+                    }}
+                    className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-[var(--md-primary)] text-[var(--md-on-primary)] text-xs font-semibold cursor-pointer disabled:opacity-60"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>{ytLoginRetryable ? 'Try again' : 'Sign in again'}</span>
+                  </button>
+                )}
+              </div>
+            )}
+
             {ytAccounts.length > 1 && (
               <div className="flex flex-wrap gap-2">
                 {ytAccounts.map((acct) => {
@@ -444,8 +577,9 @@ export const SettingsScreen: React.FC = () => {
                     <button
                       key={acct.id}
                       type="button"
+                      disabled={ytAccountMutationPending}
                       onClick={() => !isCurrent && void switchYtAccount(acct.id)}
-                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold border cursor-pointer ${
+                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold border cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed ${
                         isCurrent
                           ? 'border-[var(--md-primary)] bg-[var(--md-primary-container)]/40'
                           : 'border-[var(--md-outline-variant)]/40 bg-[var(--md-surface-container)]'
@@ -464,7 +598,7 @@ export const SettingsScreen: React.FC = () => {
             <div className="flex flex-wrap items-center gap-3">
               <button
                 type="button"
-                disabled={signingInYtMusic}
+                disabled={ytAccountMutationBusy}
                 onClick={() => void handleYtmSignIn(false)}
                 className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-[var(--md-primary)] text-[var(--md-on-primary)] text-xs font-bold hover:opacity-90 disabled:opacity-60 cursor-pointer"
               >
@@ -478,16 +612,22 @@ export const SettingsScreen: React.FC = () => {
                 </span>
               </button>
 
-              {ytLoginError && (
-                <button
-                  type="button"
-                  disabled={signingInYtMusic}
-                  onClick={() => void handleYtmSignIn(true)}
-                  className="flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl text-xs font-semibold bg-[var(--md-surface-container)] hover:bg-[var(--md-surface-container-high)] cursor-pointer disabled:opacity-60"
-                >
-                  <RotateCcw className="w-3.5 h-3.5 text-[var(--md-primary)]" />
-                  <span>Try again</span>
-                </button>
+              {ytLoginError && !ytLoginBlocked && (
+                  <button
+                    type="button"
+                    disabled={ytAccountMutationBusy}
+                    onClick={() => {
+                      if (ytLoginRetryable) {
+                        void retryYtMusicSignIn();
+                      } else {
+                        void handleYtmSignIn(true);
+                      }
+                    }}
+                    className="flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl text-xs font-semibold bg-[var(--md-surface-container)] hover:bg-[var(--md-surface-container-high)] cursor-pointer disabled:opacity-60"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5 text-[var(--md-primary)]" />
+                    <span>{ytLoginRetryable ? 'Try again' : 'Sign in again'}</span>
+                  </button>
               )}
             </div>
 
@@ -782,6 +922,211 @@ export const SettingsScreen: React.FC = () => {
         )}
       </section>
 
+      {/* Multi-Provider Lyrics (ArchiveTune Architecture) */}
+      <section
+        aria-label="Lyrics & Providers"
+        className="at-glass-card rounded-2xl border border-[var(--md-outline-variant)]/40 bg-[var(--md-surface-container-low)] p-5 space-y-5"
+      >
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="text-base font-bold flex items-center gap-2">
+              <Mic className="w-4 h-4 text-[var(--md-primary)]" />
+              <span>Lyrics & Sources (ArchiveTune Engine)</span>
+            </h2>
+            <p className="text-xs text-[var(--md-on-surface-variant)] mt-0.5">
+              Select multiple synchronized lyrics providers, manage query priority, and customize Native vs English transliteration.
+            </p>
+          </div>
+        </div>
+
+        {/* Provider Priority and Toggles */}
+        <div className="space-y-3">
+          <div className="text-xs font-semibold uppercase tracking-wider text-[var(--md-on-surface-variant)]">
+            Active Provider Priority (Queried in order)
+          </div>
+          <div className="space-y-2">
+            {currentProviders.map((providerId, idx) => {
+              const catalogItem = LYRICS_PROVIDERS_CATALOG.find((p) => p.id === providerId);
+              if (!catalogItem) return null;
+              return (
+                <div
+                  key={providerId}
+                  className="flex items-center justify-between p-3 rounded-xl bg-[var(--md-surface-container)] border border-[var(--md-outline-variant)]/30 transition-all hover:bg-[var(--md-surface-container-high)]"
+                >
+                  <div className="flex items-center gap-3 min-w-0 pr-2">
+                    <span className="flex items-center justify-center w-6 h-6 rounded-full bg-[var(--md-primary-container)] text-[var(--md-on-primary-container)] text-[11px] font-bold shrink-0">
+                      {idx + 1}
+                    </span>
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-bold leading-tight">{catalogItem.name}</span>
+                        {catalogItem.supportsSynced ? (
+                          <span className="px-1.5 py-0.5 rounded text-[9px] font-medium bg-emerald-500/15 text-emerald-400">
+                            Synced Timeline
+                          </span>
+                        ) : (
+                          <span className="px-1.5 py-0.5 rounded text-[9px] font-medium bg-white/10 text-[var(--md-on-surface-variant)]">
+                            Plain Lyrics
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-[11px] text-[var(--md-on-surface-variant)] mt-0.5 leading-snug truncate">
+                        {catalogItem.description}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button
+                      type="button"
+                      disabled={idx === 0}
+                      onClick={() => moveLyricsProvider(idx, 'up')}
+                      aria-label={`Move ${catalogItem.name} up`}
+                      className="p-1.5 rounded-lg hover:bg-white/10 text-[var(--md-on-surface-variant)] hover:text-[var(--md-on-surface)] disabled:opacity-30 disabled:pointer-events-none cursor-pointer"
+                    >
+                      <ArrowUp className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      disabled={idx === currentProviders.length - 1}
+                      onClick={() => moveLyricsProvider(idx, 'down')}
+                      aria-label={`Move ${catalogItem.name} down`}
+                      className="p-1.5 rounded-lg hover:bg-white/10 text-[var(--md-on-surface-variant)] hover:text-[var(--md-on-surface)] disabled:opacity-30 disabled:pointer-events-none cursor-pointer"
+                    >
+                      <ArrowDown className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => toggleLyricsProvider(providerId)}
+                      aria-label={`Disable ${catalogItem.name}`}
+                      className="ml-1 px-2.5 py-1 rounded-lg text-xs font-semibold bg-red-500/10 text-red-400 hover:bg-red-500/20 cursor-pointer transition-colors"
+                    >
+                      Disable
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Inactive providers */}
+          {LYRICS_PROVIDERS_CATALOG.some((p) => !currentProviders.includes(p.id)) && (
+            <div className="pt-2">
+              <div className="text-[11px] font-semibold text-[var(--md-on-surface-variant)] mb-2">
+                Available Inactive Providers
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                {LYRICS_PROVIDERS_CATALOG.filter((p) => !currentProviders.includes(p.id)).map((provider) => (
+                  <div
+                    key={provider.id}
+                    className="flex items-center justify-between p-2.5 rounded-xl bg-[var(--md-surface-container)]/50 border border-[var(--md-outline-variant)]/20"
+                  >
+                    <div className="min-w-0 pr-2">
+                      <div className="text-xs font-semibold">{provider.name}</div>
+                      <div className="text-[10px] text-[var(--md-on-surface-variant)] truncate">{provider.description}</div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => toggleLyricsProvider(provider.id)}
+                      className="px-2 py-1 rounded-lg text-xs font-semibold bg-[var(--md-primary)]/15 text-[var(--md-primary)] hover:bg-[var(--md-primary)]/25 cursor-pointer shrink-0 transition-colors"
+                    >
+                      Enable
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Preferred Lyrics Language & Settings */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2 border-t border-[var(--md-outline-variant)]/30">
+          <div>
+            <label htmlFor="preferred-lyrics-language" className="block text-xs font-semibold mb-1">
+              Preferred Lyrics Language
+            </label>
+            <p className="text-[11px] text-[var(--md-on-surface-variant)] mb-2">
+              Default language style for foreign tracks. Switch option will only appear when a song actually has an alternate language.
+            </p>
+            <select
+              id="preferred-lyrics-language"
+              value={settings.lyricsLanguage}
+              onChange={(e) =>
+                updateSettings({
+                  lyricsLanguage: e.target.value as 'NATIVE' | 'ENGLISH',
+                })
+              }
+              className="w-full h-10 rounded-xl border border-[var(--md-outline-variant)] bg-[var(--md-surface-container)] px-3 text-xs"
+            >
+              <option value="NATIVE">Native Language (Original Script)</option>
+              <option value="ENGLISH">English (Transliteration / Translation)</option>
+            </select>
+          </div>
+
+          <div>
+            <label className="block text-xs font-semibold mb-1">
+              Live Lyrics Sync Offset ({settings.lyricsOffsetMs > 0 ? `+${settings.lyricsOffsetMs}` : settings.lyricsOffsetMs} ms)
+            </label>
+            <p className="text-[11px] text-[var(--md-on-surface-variant)] mb-2">
+              Fine-tune the timeline synchronization speed if lyrics are leading or lagging.
+            </p>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => updateSettings({ lyricsOffsetMs: (settings.lyricsOffsetMs || 0) - 200 })}
+                className="px-3 h-10 rounded-xl border border-[var(--md-outline-variant)] bg-[var(--md-surface-container)] text-xs font-bold hover:bg-[var(--md-surface-container-high)] cursor-pointer"
+              >
+                -200ms
+              </button>
+              <button
+                type="button"
+                onClick={() => updateSettings({ lyricsOffsetMs: 0 })}
+                className="flex-1 h-10 rounded-xl border border-[var(--md-outline-variant)] bg-[var(--md-surface-container)] text-xs font-semibold hover:bg-[var(--md-surface-container-high)] cursor-pointer"
+              >
+                Reset (0 ms)
+              </button>
+              <button
+                type="button"
+                onClick={() => updateSettings({ lyricsOffsetMs: (settings.lyricsOffsetMs || 0) + 200 })}
+                className="px-3 h-10 rounded-xl border border-[var(--md-outline-variant)] bg-[var(--md-surface-container)] text-xs font-bold hover:bg-[var(--md-surface-container-high)] cursor-pointer"
+              >
+                +200ms
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Translation subtitle and Font Scale */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <ToggleSwitch
+            checked={settings.showSyncedLyricsTranslation}
+            onChange={(checked) => updateSettings({ showSyncedLyricsTranslation: checked })}
+            label="Translation Subtitles"
+            description="Display real-time translated lyrics subtitle line below active karaoke lines"
+            icon={<Languages className="w-4 h-4" />}
+          />
+
+          <div>
+            <label htmlFor="lyrics-font-scale" className="block text-xs font-semibold mb-1">
+              Lyrics Font Size Scale ({Math.round(settings.lyricsFontScale * 100)}%)
+            </label>
+            <p className="text-[11px] text-[var(--md-on-surface-variant)] mb-2">
+              Scale lyrics text size in Full Player and cinema view.
+            </p>
+            <input
+              id="lyrics-font-scale"
+              type="range"
+              min="0.75"
+              max="1.5"
+              step="0.05"
+              value={settings.lyricsFontScale}
+              onChange={(e) => updateSettings({ lyricsFontScale: parseFloat(e.target.value) })}
+              className="w-full accent-[var(--md-primary)] cursor-pointer"
+            />
+          </div>
+        </div>
+      </section>
+
       {/* Appearance & Theme Studio */}
       <section className="at-glass-card rounded-2xl border border-[var(--md-outline-variant)]/40 bg-[var(--md-surface-container-low)] p-5 space-y-5">
         <h2 className="text-base font-bold flex items-center gap-2">
@@ -879,18 +1224,7 @@ export const SettingsScreen: React.FC = () => {
           </div>
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <ToggleSwitch
-            checked={settings.pureBlack}
-            onChange={(checked) =>
-              updateSettings({
-                pureBlack: checked,
-                themeSurfaceStyle: checked ? 'PURE_BLACK' : 'MATERIAL',
-              })
-            }
-            label="Pure Black AMOLED Surface"
-            description="True deep black background for OLED and AMOLED screens"
-          />
+        <div>
           <ToggleSwitch
             checked={settings.dynamicThemeFromArtwork}
             onChange={(checked) => updateSettings({ dynamicThemeFromArtwork: checked })}
@@ -1207,16 +1541,26 @@ export const SettingsScreen: React.FC = () => {
         <div className="pt-1">
           <button
             type="button"
+            disabled={resettingAllData}
             onClick={() => {
               if (
                 window.confirm(
-                  'Are you sure you want to clear all local playlists, library data, and cache? This will reset the app to a fresh, default state.',
+                  'Are you sure you want to clear all local playlists, library data, and cache? This will also sign out of every YouTube Music account. The reset is canceled if browser-session cleanup fails.',
                 )
               ) {
-                void resetAllUserData();
+                setResettingAllData(true);
+                void resetAllUserData()
+                  .catch((error) => {
+                    const message =
+                      error instanceof Error
+                        ? error.message
+                        : 'Could not reset all local data.';
+                    showToast(message, 'error');
+                  })
+                  .finally(() => setResettingAllData(false));
               }
             }}
-            className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-red-500/15 hover:bg-red-500/25 border border-red-500/30 text-red-400 text-xs font-bold cursor-pointer transition-colors"
+            className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-red-500/15 hover:bg-red-500/25 border border-red-500/30 text-red-400 text-xs font-bold cursor-pointer transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
           >
             <Trash2 className="w-4 h-4" />
             <span>Reset All Local Data &amp; Playlists</span>

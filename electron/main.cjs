@@ -86,6 +86,11 @@ app.commandLine.appendSwitch(
   'disable-features',
   'WebAuthentication,WebAuthenticationConditionalUI,WebAuthn',
 );
+// Keep Electron/Chromium RAM usage lean
+app.commandLine.appendSwitch('js-flags', '--max-old-space-size=384');
+app.commandLine.appendSwitch('disk-cache-size', String(50 * 1024 * 1024));
+app.commandLine.appendSwitch('media-cache-size', String(50 * 1024 * 1024));
+app.commandLine.appendSwitch('renderer-process-limit', '2');
 
 // Default YouTube Music login mode to 'native' (works better than 'firefox' fallback)
 if (!process.env.RIRI_YTM_LOGIN_MODE) {
@@ -108,6 +113,30 @@ let isQuitting = false;
 let minimizeToTraySetting = false;
 
 const LAUNCH_SECRET = crypto.randomBytes(24).toString('hex');
+const PORT_STATE_FILE = path.join(app.getPath('userData'), 'launcher-port.json');
+
+async function readPersistedPort() {
+  try {
+    const raw = await fs.promises.readFile(PORT_STATE_FILE, 'utf8');
+    const obj = JSON.parse(raw);
+    if (typeof obj.port === 'number' && obj.port > 0) return obj.port;
+  } catch {
+    // No persisted port yet; will use a random port and persist it.
+  }
+  return null;
+}
+
+async function persistPort(port) {
+  try {
+    await fs.promises.writeFile(
+      PORT_STATE_FILE,
+      JSON.stringify({ port, updatedAt: Date.now() }),
+      { encoding: 'utf8', mode: 0o600 },
+    );
+  } catch {
+    // Persisting the port is best-effort; a random port will be used next launch.
+  }
+}
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
@@ -139,14 +168,28 @@ async function startInternalBackend() {
     try {
       const { startAppServer } = require('./server.cjs');
       const distDir = path.join(__dirname, '..', 'dist');
-      const res = await startAppServer({
-        distDir,
-        port: 0,
-        host: '127.0.0.1',
-        launchSecret: LAUNCH_SECRET,
-      });
+      const preferredPort = await readPersistedPort();
+      let res;
+      try {
+        res = await startAppServer({
+          distDir,
+          port: preferredPort || 0,
+          host: '127.0.0.1',
+          launchSecret: LAUNCH_SECRET,
+        });
+      } catch (err) {
+        // Preferred persisted port is in use; fall back to a random port.
+        console.warn('[Backend] Preferred port in use, using random port:', err.message);
+        res = await startAppServer({
+          distDir,
+          port: 0,
+          host: '127.0.0.1',
+          launchSecret: LAUNCH_SECRET,
+        });
+      }
       appPort = res.port;
       appServer = res.server;
+      await persistPort(appPort);
       console.log(`Internal Riri Player proxy listening on http://127.0.0.1:${appPort}`);
     } catch (err) {
       console.error('Failed to start internal backend:', err);
@@ -240,8 +283,8 @@ function toggleOverlayWindow() {
   const primaryDisplay = screen.getPrimaryDisplay();
   const { width, height } = primaryDisplay.workAreaSize;
 
-  const overlayWidth = 380;
-  const overlayHeight = 185;
+  const overlayWidth = 468;
+  const overlayHeight = 192;
   const overlayX = Math.max(10, Math.round(width - overlayWidth - 24));
   const overlayY = Math.max(10, Math.round(height - overlayHeight - 24));
 
@@ -250,6 +293,10 @@ function toggleOverlayWindow() {
   overlayWindow = new BrowserWindow({
     width: overlayWidth,
     height: overlayHeight,
+    minWidth: overlayWidth,
+    minHeight: overlayHeight,
+    maxWidth: overlayWidth,
+    maxHeight: overlayHeight,
     x: overlayX,
     y: overlayY,
     frame: false,
@@ -258,6 +305,7 @@ function toggleOverlayWindow() {
     skipTaskbar: false,
     resizable: false,
     hasShadow: false,
+    fullscreenable: false,
     icon: iconPath,
     backgroundColor: '#00000000',
     webPreferences: {
@@ -268,6 +316,19 @@ function toggleOverlayWindow() {
     },
   });
 
+  // Pin mini-player at screen-saver level so it stays above fullscreen games and other apps
+  const enforceOverlayTopmost = () => {
+    if (overlayWindow && !overlayWindow.isDestroyed()) {
+      overlayWindow.setAlwaysOnTop(true, 'screen-saver', 1);
+    }
+  };
+  enforceOverlayTopmost();
+  overlayWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  overlayWindow.once('ready-to-show', enforceOverlayTopmost);
+  overlayWindow.on('show', enforceOverlayTopmost);
+  overlayWindow.on('blur', enforceOverlayTopmost);
+  const topmostInterval = setInterval(enforceOverlayTopmost, 2000);
+
   const isDev = !app.isPackaged;
   const targetUrl = isDev
     ? 'http://localhost:3000/#/mini-overlay'
@@ -276,6 +337,7 @@ function toggleOverlayWindow() {
   overlayWindow.loadURL(targetUrl);
 
   overlayWindow.on('closed', () => {
+    clearInterval(topmostInterval);
     overlayWindow = null;
     if (mainWindow && !mainWindow.isDestroyed()) {
       if (mainWindow.isMinimized()) mainWindow.restore();
@@ -401,6 +463,11 @@ app.whenReady().then(async () => {
   ipcMain.on('ririplayer:set-overlay-movable', (_event, movable) => {
     if (overlayWindow && !overlayWindow.isDestroyed()) {
       overlayWindow.setMovable(Boolean(movable));
+    }
+  });
+  ipcMain.on('ririplayer:minimize-overlay', () => {
+    if (overlayWindow && !overlayWindow.isDestroyed()) {
+      overlayWindow.minimize();
     }
   });
 

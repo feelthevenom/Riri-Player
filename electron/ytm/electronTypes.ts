@@ -16,7 +16,9 @@ export interface ElectronOnErrorOccurredDetailsLike {
 }
 
 export interface ElectronSessionLike {
+  getUserAgent?: () => string;
   setUserAgent: (userAgent: string) => void;
+  clearCache?: () => Promise<void>;
   webRequest: {
     onBeforeSendHeaders: {
       (
@@ -94,5 +96,7 @@ export interface ElectronIpcMainLike {
 export interface ElectronSafeStorageLike {
   isAsyncEncryptionAvailable: () => Promise<boolean>;
   encryptStringAsync: (plainText: string) => Promise<Buffer>;
-  decryptStringAsync: (encrypted: Buffer) => Promise<string>;
+  decryptStringAsync: (
+    encrypted: Buffer,
+  ) => Promise<string | { result: string; shouldReEncrypt?: boolean }>;
 }

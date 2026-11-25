@@ -128,6 +128,7 @@ export const DetailScreen: React.FC = () => {
   const heroArt =
     playlistCover ||
     playlist?.coverUrl ||
+    browsedCollection?.thumbnailUrl ||
     detailTracks[0]?.thumbnailUrl ||
     browsedCollection?.cards?.[0]?.thumbnailUrl ||
     FALLBACK_ARTWORK_DATA_URL;

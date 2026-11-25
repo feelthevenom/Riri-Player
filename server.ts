@@ -10,6 +10,7 @@ import {
   importYtmSessionFallback,
   logoutYtmAccount,
   switchYtmAccount,
+  YtmAuthVerificationError,
 } from './electron/ytm/auth';
 import {
   ORIGIN_YOUTUBE,
@@ -27,10 +28,22 @@ import {
   fetchYtmSearchSuggestions,
   searchYtm,
 } from './electron/ytm/homeSearchQueue';
-import { getActiveYtAccount, updateSpotifyCredentials } from './electron/ytm/credentials';
+import {
+  configureCredentialStorage,
+  getActiveYtAccount,
+  updateSpotifyCredentials,
+  YtAccountNotFoundError,
+  YtAccountStateConflictError,
+  YtVaultUnreadableError,
+} from './electron/ytm/credentials';
 import { innerTubePost } from './electron/ytm/innertube';
 import { setYtmLikeStatus, syncYtmLibrary } from './electron/ytm/library';
 import type { SpotifySyncSchedule } from './src/types/music';
+import { AsyncTtlCache } from './src/utils/asyncTtlCache';
+import { resolveFirstLyricsCandidate } from './src/utils/lyricsResolver';
+import {
+  transliterateLyrics,
+} from './src/utils/transliterate';
 import {
   AudioQuality,
   AdaptiveAudioFormat,
@@ -339,6 +352,16 @@ interface ResolvedStreamResult {
 }
 
 const resolvedStreamCache = new Map<string, { expiresAt: number; data: ResolvedStreamResult }>();
+
+interface LyricsServerResult {
+  ok: boolean;
+  syncedLyrics: string;
+  plainLyrics: string;
+  provider: string;
+  source: string;
+}
+
+const lyricsServerCache = new AsyncTtlCache<LyricsServerResult>();
 
 const PIPED_INSTANCES = [
   'https://pipedapi.kavin.rocks',
@@ -749,6 +772,53 @@ function timingSafeMatch(provided: string, expected: string): boolean {
   return crypto.timingSafeEqual(a, b);
 }
 
+function sendYtmAuthError(res: express.Response, err: unknown): void {
+  const message = err instanceof Error ? err.message : 'YouTube Music authentication failed.';
+  if (err instanceof YtAccountNotFoundError) {
+    res.status(404).json({
+      ok: false,
+      error: message,
+      code: err.name,
+      retryable: false,
+    });
+    return;
+  }
+  if (err instanceof YtAccountStateConflictError) {
+    res.status(409).json({
+      ok: false,
+      error: message,
+      code: err.name,
+      retryable: true,
+    });
+    return;
+  }
+  if (err instanceof YtVaultUnreadableError) {
+    res.status(503).json({
+      ok: false,
+      error: message,
+      code: err.name,
+      retryable: true,
+      diagnostic: err.diagnostic,
+    });
+    return;
+  }
+  if (err instanceof YtmAuthVerificationError) {
+    res.status(503).json({
+      ok: false,
+      error: message,
+      code: err.name,
+      retryable: true,
+    });
+    return;
+  }
+  res.status(500).json({
+    ok: false,
+    error: message,
+    code: err instanceof Error && err.name ? err.name : 'YtmAuthError',
+    retryable: false,
+  });
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Express Server
 // ──────────────────────────────────────────────────────────────────────────────
@@ -761,11 +831,40 @@ export interface StartAppServerOptions {
   enableViteDev?: boolean;
 }
 
+async function configureElectronCredentialStorageIfAvailable(): Promise<void> {
+  try {
+    const electronModule = (await import('electron')) as unknown as {
+      app?: { getPath?: (name: string) => string };
+      safeStorage?: {
+        isEncryptionAvailable?: () => boolean;
+        encryptString?: (plainText: string) => Buffer;
+        decryptString?: (cipherText: Buffer) => string;
+        isAsyncEncryptionAvailable?: () => Promise<boolean>;
+        encryptStringAsync?: (plainText: string) => Promise<Buffer>;
+        decryptStringAsync?: (
+          cipherText: Buffer,
+        ) => Promise<string | { result: string; shouldReEncrypt?: boolean }>;
+      };
+    };
+    const electronApp = electronModule.app;
+    const electronSafeStorage = electronModule.safeStorage;
+    if (!electronApp?.getPath || !electronSafeStorage) return;
+    configureCredentialStorage({
+      userDataPath: electronApp.getPath('userData'),
+      safeStorage: electronSafeStorage,
+    });
+  } catch {
+    // The standalone development server has no Electron safeStorage bridge.
+    // Desktop sessions remain authoritative in the Electron main process.
+  }
+}
+
 export async function startAppServer(opts: StartAppServerOptions = {}): Promise<{
   app: express.Express;
   server: http.Server;
   port: number;
 }> {
+  await configureElectronCredentialStorageIfAvailable();
   const app = express();
   app.use(express.json({ limit: '1mb' }));
 
@@ -993,7 +1092,11 @@ export async function startAppServer(opts: StartAppServerOptions = {}): Promise<
 
     const resolved = await resolveYouTubeAudioStream(videoId, cfg, quality, durationSec);
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.status(resolved ? 200 : 404).json(resolved || { ok: false, error: 'Stream unavailable' });
+    res.status(resolved ? 200 : 404).json(
+      resolved
+        ? { ok: true, videoId, ...resolved }
+        : { ok: false, videoId, error: 'Stream unavailable' },
+    );
   });
 
   // ── Stream Info (for frontend to get stream URL + fallback info) ───────────
@@ -1065,7 +1168,7 @@ export async function startAppServer(opts: StartAppServerOptions = {}): Promise<
     return res.status(404).json({ ok: false, error: 'No full-length audio stream available' });
   });
 
-  // ── Image Proxy (SSRF-hardened) ────────────────────────────────────────────
+  // ── Image Proxy (SSRF-hardened + highest-quality artwork upgrade) ─────────
   app.get('/api/proxy-image', async (req, res) => {
     const rawUrl = String(req.query.url || '').trim();
     const parsed = parseSafeExternalUrl(rawUrl);
@@ -1074,29 +1177,63 @@ export async function startAppServer(opts: StartAppServerOptions = {}): Promise<
       return;
     }
 
+    const originalStr = parsed.toString();
+    const candidateUrls: string[] = [];
+    if (/^https?:\/\/(lh3\.googleusercontent\.com|yt3\.ggpht\.com|yt3\.googleusercontent\.com)\//i.test(originalStr)) {
+      let upgraded = originalStr;
+      if (/=w\d+-h\d+/i.test(upgraded)) {
+        upgraded = upgraded.replace(/=w\d+-h\d+([^?\s]*)/i, (_m, rest) => {
+          const updatedRest = String(rest || '').replace(/-l\d+/i, '-l100');
+          return `=w1200-h1200${updatedRest}`;
+        });
+      } else if (/=s\d+/i.test(upgraded)) {
+        upgraded = upgraded.replace(/=s\d+/i, '=s1200');
+      }
+      candidateUrls.push(upgraded);
+      if (upgraded !== originalStr) candidateUrls.push(originalStr);
+    } else if (/^https?:\/\/i\d*\.ytimg\.com\/vi(?:_webp)?\/[^/]+\/(?:default|mqdefault|hqdefault|sddefault|maxresdefault)\.(jpg|webp)/i.test(originalStr)) {
+      candidateUrls.push(
+        originalStr.replace(/\/(default|mqdefault|hqdefault|sddefault|maxresdefault)\.(jpg|webp)/i, '/maxresdefault.$2'),
+        originalStr.replace(/\/(default|mqdefault|hqdefault|sddefault|maxresdefault)\.(jpg|webp)/i, '/sddefault.$2'),
+        originalStr.replace(/\/(default|mqdefault|hqdefault|sddefault|maxresdefault)\.(jpg|webp)/i, '/hqdefault.$2'),
+      );
+      if (!candidateUrls.includes(originalStr)) candidateUrls.push(originalStr);
+    } else {
+      candidateUrls.push(originalStr);
+    }
+
+    const headers = {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
+      Referer: 'https://music.youtube.com/',
+    };
+
     try {
-      const upstream = await fetch(parsed.toString(), {
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
-          Referer: 'https://music.youtube.com/',
-        },
-        signal: AbortSignal.timeout(10000),
-      });
-      if (!upstream.ok) {
-        res.status(upstream.status).end();
+      let lastStatus = 502;
+      for (const targetUrl of candidateUrls) {
+        const safeTarget = parseSafeExternalUrl(targetUrl);
+        if (!safeTarget) continue;
+        const upstream = await fetch(safeTarget.toString(), {
+          headers,
+          signal: AbortSignal.timeout(10000),
+        });
+        if (!upstream.ok) {
+          lastStatus = upstream.status;
+          continue;
+        }
+        const ctype = upstream.headers.get('content-type') || 'image/jpeg';
+        if (!ctype.startsWith('image/')) {
+          lastStatus = 415;
+          continue;
+        }
+        res.setHeader('Content-Type', ctype);
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+        const buf = Buffer.from(await upstream.arrayBuffer());
+        res.send(buf);
         return;
       }
-      const ctype = upstream.headers.get('content-type') || 'image/jpeg';
-      if (!ctype.startsWith('image/')) {
-        res.status(415).end();
-        return;
-      }
-      res.setHeader('Content-Type', ctype);
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Cache-Control', 'public, max-age=86400');
-      const buf = Buffer.from(await upstream.arrayBuffer());
-      res.send(buf);
+      res.status(lastStatus).end();
     } catch {
       res.status(502).end();
     }
@@ -1104,51 +1241,98 @@ export async function startAppServer(opts: StartAppServerOptions = {}): Promise<
 
   // ── YouTube Music Auth & Library Routes (unchanged) ────────────────────────
   app.get('/api/auth/ytm/status', async (_req, res) => {
-    res.json(await getYtmAuthStatus());
+    try {
+      res.json(await getYtmAuthStatus());
+    } catch (err) {
+      sendYtmAuthError(res, err);
+    }
   });
 
   app.post('/api/auth/ytm/import-browser', async (req, res) => {
-    const out = await importYtmSessionFallback(req.body || {});
-    res.status(out.ok ? 200 : 400).json(out);
+    try {
+      const safePayload = {
+        cookieHeader:
+          typeof req.body?.cookieHeader === 'string' ? req.body.cookieHeader : '',
+        visitorData:
+          typeof req.body?.visitorData === 'string' ? req.body.visitorData : undefined,
+        dataSyncId:
+          typeof req.body?.dataSyncId === 'string' ? req.body.dataSyncId : undefined,
+        accountIndex:
+          typeof req.body?.accountIndex === 'number' ? req.body.accountIndex : undefined,
+      };
+      const out = await importYtmSessionFallback(safePayload);
+      res.status(out.ok ? 200 : 400).json(out);
+    } catch (err) {
+      sendYtmAuthError(res, err);
+    }
   });
 
   app.post('/api/auth/ytm/switch', async (req, res) => {
-    const accountId = String(req.body?.accountId || '');
-    res.json(await switchYtmAccount(accountId));
+    try {
+      const accountId = String(req.body?.accountId || '');
+      res.json(await switchYtmAccount(accountId));
+    } catch (err) {
+      sendYtmAuthError(res, err);
+    }
   });
 
   app.post('/api/auth/ytm/logout', async (req, res) => {
-    const accountId = req.body?.accountId ? String(req.body.accountId) : undefined;
-    res.json(await logoutYtmAccount({ accountId }));
+    try {
+      const accountId = req.body?.accountId ? String(req.body.accountId) : undefined;
+      res.json(await logoutYtmAccount({ accountId }));
+    } catch (err) {
+      sendYtmAuthError(res, err);
+    }
   });
 
   app.post('/api/ytmusic/library', async (req, res) => {
-    const result = await syncYtmLibrary({
-      gl: req.body?.gl || 'US',
-      hl: req.body?.hl || 'en',
-    });
-    res.status(result.ok ? 200 : 400).json(result);
+    try {
+      const result = await syncYtmLibrary({
+        gl: req.body?.gl || 'US',
+        hl: req.body?.hl || 'en',
+      });
+      res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) {
+      sendYtmAuthError(res, err);
+    }
   });
 
   app.post('/api/ytmusic/like', async (req, res) => {
-    const result = await setYtmLikeStatus({
-      videoId: String(req.body?.videoId || ''),
-      liked: Boolean(req.body?.liked),
-      gl: req.body?.gl,
-      hl: req.body?.hl,
-    });
-    res.json(result);
+    try {
+      const result = await setYtmLikeStatus({
+        videoId: String(req.body?.videoId || ''),
+        liked: Boolean(req.body?.liked),
+        gl: req.body?.gl,
+        hl: req.body?.hl,
+        expectedAccountId:
+          typeof req.body?.expectedAccountId === 'string'
+            ? req.body.expectedAccountId
+            : undefined,
+      });
+      res.json(result);
+    } catch (err) {
+      sendYtmAuthError(res, err);
+    }
   });
 
   app.post('/api/ytmusic/edit-playlist', async (req, res) => {
-    const active = await getActiveYtAccount();
     const playlistId = String(req.body?.playlistId || '').replace(/^VL/, '').trim();
     const videoId = String(req.body?.videoId || '').trim();
-    if (!active || !playlistId || !videoId) {
-      res.json({ ok: false });
-      return;
-    }
     try {
+      const active = await getActiveYtAccount();
+      const expectedAccountId =
+        typeof req.body?.expectedAccountId === 'string'
+          ? req.body.expectedAccountId
+          : undefined;
+      if (
+        !active ||
+        !playlistId ||
+        !videoId ||
+        (expectedAccountId && expectedAccountId !== active.id)
+      ) {
+        res.json({ ok: false });
+        return;
+      }
       await innerTubePost({
         endpoint: 'browse/edit_playlist',
         body: {
@@ -1157,9 +1341,15 @@ export async function startAppServer(opts: StartAppServerOptions = {}): Promise<
         },
         gl: String(req.body?.gl || 'US'),
         hl: String(req.body?.hl || 'en'),
+        requireAuth: true,
+        accountOverride: active,
       });
       res.json({ ok: true });
-    } catch {
+    } catch (err) {
+      if (err instanceof YtVaultUnreadableError || err instanceof YtAccountNotFoundError) {
+        sendYtmAuthError(res, err);
+        return;
+      }
       res.json({ ok: false });
     }
   });
@@ -1278,6 +1468,10 @@ export async function startAppServer(opts: StartAppServerOptions = {}): Promise<
     res.status(out.ok ? 200 : 400).json(out);
   });
 
+  app.get('/api/spotify/sync-progress', (_req, res) => {
+    res.json({ ok: true, progress: getSpotifySyncProgress() });
+  });
+
   app.post('/api/spotify/import-playlist', async (req, res) => {
     const out = await resolveManualSpotifyTrackList({
       input: String(req.body?.input || ''),
@@ -1309,54 +1503,385 @@ export async function startAppServer(opts: StartAppServerOptions = {}): Promise<
     res.json({ ok: true, connection: updated });
   });
 
-  // ── Lyrics & SponsorBlock ──────────────────────────────────────────────────
+  // ── Multi-Provider Lyrics (ArchiveTune Architecture) ────────────────────────
+  function formatLrcTimestamp(ms: number): string {
+    const mins = Math.floor(ms / 60000);
+    const secs = Math.floor((ms % 60000) / 1000);
+    const hundredths = Math.floor((ms % 1000) / 10);
+    return `[${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}.${String(hundredths).padStart(2, '0')}]`;
+  }
+
+  function providerTimeoutSignal(
+    timeoutMs: number,
+    parentSignal?: AbortSignal,
+  ): AbortSignal {
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
+    return parentSignal
+      ? AbortSignal.any([parentSignal, timeoutSignal])
+      : timeoutSignal;
+  }
+
+  async function fetchLrclibProvider(
+    title: string,
+    artist: string,
+    durationSec?: number,
+    signal?: AbortSignal,
+  ) {
+    const lrcUrl = new URL('https://lrclib.net/api/get');
+    lrcUrl.searchParams.set('track_name', title);
+    lrcUrl.searchParams.set('artist_name', artist);
+    if (durationSec && durationSec > 0) {
+      lrcUrl.searchParams.set('duration', String(Math.round(durationSec)));
+    }
+    const res = await fetch(lrcUrl.toString(), {
+      headers: { 'User-Agent': 'RiriPlayer/1.2 (ArchiveTune-Engine)' },
+      signal: providerTimeoutSignal(6000, signal),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { syncedLyrics?: string; plainLyrics?: string };
+    if (data.syncedLyrics || data.plainLyrics) {
+      return {
+        syncedLyrics: data.syncedLyrics || '',
+        plainLyrics: data.plainLyrics || '',
+        provider: 'lrclib',
+        source: 'LRCLIB',
+      };
+    }
+    return null;
+  }
+
+  async function fetchYouLyPlusProvider(
+    title: string,
+    artist: string,
+    signal?: AbortSignal,
+  ) {
+    const baseUrls = [
+      'https://lyricsplus.prjktla.my.id/',
+      'https://lyricsplus.atomix.one/',
+    ];
+    for (const base of baseUrls) {
+      try {
+        const url = `${base}v2/lyrics/get?title=${encodeURIComponent(title)}&artist=${encodeURIComponent(artist)}`;
+        const res = await fetch(url, {
+          headers: { 'User-Agent': 'ArchiveTune' },
+          signal: providerTimeoutSignal(5000, signal),
+        });
+        if (!res.ok) continue;
+        const data = (await res.json()) as {
+          lyrics?: Array<{ time?: number; text?: string }>;
+        };
+        if (Array.isArray(data?.lyrics) && data.lyrics.length > 0) {
+          const lrcLines = data.lyrics
+            .filter((l) => typeof l.time === 'number' && typeof l.text === 'string')
+            .map((l) => `${formatLrcTimestamp(l.time!)} ${l.text!.trim()}`)
+            .join('\n');
+          const plainLines = data.lyrics
+            .map((l) => l.text?.trim() || '')
+            .filter(Boolean)
+            .join('\n');
+          return {
+            syncedLyrics: lrcLines,
+            plainLyrics: plainLines,
+            provider: 'youlyplus',
+            source: 'YouLy+',
+          };
+        }
+      } catch {
+        // try next base URL
+      }
+    }
+    return null;
+  }
+
+  async function fetchKuGouProvider(
+    title: string,
+    artist: string,
+    durationSec?: number,
+    signal?: AbortSignal,
+  ) {
+    try {
+      const kw = `${title} ${artist}`.trim();
+      const sUrl = `https://mobileservice.kugou.com/api/v3/search/song?version=9108&plat=0&pagesize=8&showtype=0&keyword=${encodeURIComponent(kw)}`;
+      const sRes = await fetch(sUrl, {
+        signal: providerTimeoutSignal(6000, signal),
+      });
+      if (!sRes.ok) return null;
+      const sData = (await sRes.json()) as {
+        data?: { info?: Array<{ hash: string; duration: number }> };
+      };
+      const songs = sData?.data?.info || [];
+      if (songs.length === 0) return null;
+
+      for (const song of songs.slice(0, 4)) {
+        if (durationSec && durationSec > 0 && Math.abs(song.duration - durationSec) > 15) {
+          continue;
+        }
+        try {
+          const cUrl = `https://lyrics.kugou.com/search?ver=1&man=yes&client=pc&hash=${song.hash}`;
+          const cRes = await fetch(cUrl, {
+            signal: providerTimeoutSignal(4000, signal),
+          });
+          if (!cRes.ok) continue;
+          const cData = (await cRes.json()) as {
+            candidates?: Array<{ id: string | number; accesskey: string }>;
+          };
+          const cand = cData?.candidates?.[0];
+          if (!cand) continue;
+
+          const dUrl = `https://lyrics.kugou.com/download?ver=1&client=pc&id=${cand.id}&accesskey=${cand.accesskey}&fmt=lrc&charset=utf8`;
+          const dRes = await fetch(dUrl, {
+            signal: providerTimeoutSignal(5000, signal),
+          });
+          if (!dRes.ok) continue;
+          const dData = (await dRes.json()) as { content?: string };
+          if (dData?.content) {
+            const lrc = Buffer.from(dData.content, 'base64').toString('utf8');
+            if (lrc.length > 20) {
+              return {
+                syncedLyrics: lrc,
+                plainLyrics: '',
+                provider: 'kugou',
+                source: 'KuGou Music',
+              };
+            }
+          }
+        } catch {
+          // try next candidate
+        }
+      }
+    } catch {
+      // KuGou error
+    }
+    return null;
+  }
+
+  async function fetchSimpMusicProvider(
+    videoId: string,
+    signal?: AbortSignal,
+  ) {
+    if (!videoId) return null;
+    try {
+      const url = `https://api-lyrics.simpmusic.org/v1/${videoId}`;
+      const res = await fetch(url, {
+        headers: { 'User-Agent': 'SimpMusicLyrics/1.0', Accept: 'application/json' },
+        signal: providerTimeoutSignal(6000, signal),
+      });
+      if (!res.ok) return null;
+      const data = (await res.json()) as {
+        success?: boolean;
+        data?: Array<{ syncedLyrics?: string; plainLyrics?: string; plainLyric?: string }>;
+      };
+      if (data?.success && Array.isArray(data.data) && data.data.length > 0) {
+        const item = data.data[0];
+        const plainLyrics = item.plainLyrics || item.plainLyric || '';
+        if (item.syncedLyrics || plainLyrics) {
+          return {
+            syncedLyrics: item.syncedLyrics || '',
+            plainLyrics,
+            provider: 'simpmusic',
+            source: 'SimpMusic',
+          };
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  }
+
+  async function fetchServerLyricsProvider(
+    provider: string,
+    title: string,
+    artist: string,
+    videoId: string,
+    duration: number | undefined,
+    gl: string,
+    hl: string,
+    signal?: AbortSignal,
+  ): Promise<LyricsServerResult | null> {
+    if (provider === 'lrclib' && title) {
+      const result = await fetchLrclibProvider(title, artist, duration, signal);
+      if (result && (result.syncedLyrics || result.plainLyrics)) {
+        return { ok: true, ...result };
+      }
+    } else if (provider === 'youlyplus' && title) {
+      const result = await fetchYouLyPlusProvider(title, artist, signal);
+      if (result && (result.syncedLyrics || result.plainLyrics)) {
+        return { ok: true, ...result };
+      }
+    } else if (provider === 'kugou' && title) {
+      const result = await fetchKuGouProvider(title, artist, duration, signal);
+      if (result && result.syncedLyrics) {
+        return { ok: true, ...result };
+      }
+    } else if (provider === 'simpmusic' && videoId) {
+      const result = await fetchSimpMusicProvider(videoId, signal);
+      if (result && (result.syncedLyrics || result.plainLyrics)) {
+        return { ok: true, ...result };
+      }
+    } else if (provider === 'ytm' && videoId) {
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      const abortResult = new Promise<Record<string, never>>((resolve) => {
+        if (!signal) return;
+        if (signal.aborted) {
+          resolve({});
+          return;
+        }
+        signal.addEventListener('abort', () => resolve({}), { once: true });
+      });
+      const ytmLyrics = await Promise.race([
+        fetchYtmLyrics({ videoId, gl, hl, signal }).catch(() => ({})),
+        new Promise<Record<string, never>>((resolve) => {
+          timeout = setTimeout(() => resolve({}), 7000);
+        }),
+        abortResult,
+      ]);
+      if (timeout) clearTimeout(timeout);
+      if ('plainLyrics' in ytmLyrics && ytmLyrics.plainLyrics) {
+        return {
+          ok: true,
+          syncedLyrics: '',
+          plainLyrics: ytmLyrics.plainLyrics,
+          provider: 'ytm',
+          source: 'YouTube Music',
+        };
+      }
+    }
+    return null;
+  }
+
+  async function fetchFirstServerLyricsProvider(
+    providers: string[],
+    title: string,
+    artist: string,
+    videoId: string,
+    duration: number | undefined,
+    gl: string,
+    hl: string,
+    signal?: AbortSignal,
+    onLateUpgrade?: (result: LyricsServerResult) => void,
+  ): Promise<LyricsServerResult | null> {
+    if (providers.length === 0) return null;
+
+    const tasks = providers.map((provider, index) => ({
+      rank: index,
+      promise: (async () => {
+        // Preserve the configured provider priority with a small head start
+        // instead of waiting for each provider sequentially.
+        if (index > 0) {
+          await new Promise((resolve) => setTimeout(resolve, index * 120));
+        }
+        return await fetchServerLyricsProvider(
+          provider,
+          title,
+          artist,
+          videoId,
+          duration,
+          gl,
+          hl,
+          signal,
+        );
+      })(),
+    }));
+    return await resolveFirstLyricsCandidate(tasks, {
+      getPriority: (candidate, fallbackRank) => {
+        const providerIndex = providers.indexOf(candidate.provider);
+        return providerIndex >= 0 ? providerIndex : fallbackRank;
+      },
+      onLateUpgrade,
+    });
+  }
+
   app.get('/api/lyrics', async (req, res) => {
     const title = String(req.query.title || '').trim();
     const artist = String(req.query.artist || '').trim();
     const videoId = String(req.query.videoId || '').trim();
+    const duration = req.query.duration ? parseFloat(String(req.query.duration)) : undefined;
+    const gl = String(req.query.gl || 'US');
+    const hl = String(req.query.hl || 'en');
+    const providersParam = String(
+      req.query.providers || 'lrclib,youlyplus,kugou,simpmusic,ytm',
+    );
+    const enabledProviders = Array.from(
+      new Set(
+        providersParam
+          .split(',')
+          .map((provider) => provider.trim().toLowerCase())
+          .filter((provider) =>
+            ['lrclib', 'youlyplus', 'kugou', 'simpmusic', 'ytm'].includes(provider),
+          ),
+      ),
+    );
+    const cacheKey = [
+      videoId || `${title}|${artist}|${Math.round(duration || 0)}`,
+      enabledProviders.join(','),
+      gl,
+      hl,
+    ].join('::');
+    const forceRefresh = String(req.query.refresh || '') === '1';
+    const requestController = new AbortController();
+    const abortProviders = () => requestController.abort();
+    req.once('aborted', abortProviders);
+    res.once('close', () => {
+      if (!res.writableEnded) abortProviders();
+    });
+    const ttlForResult = (result: LyricsServerResult): number => {
+      if (!result.ok) return 5 * 60 * 1000;
+      return result.syncedLyrics ? 6 * 60 * 60 * 1000 : 2 * 60 * 1000;
+    };
 
-    if (title) {
-      try {
-        const lrcUrl = `https://lrclib.net/api/get?track_name=${encodeURIComponent(
-          title,
-        )}&artist_name=${encodeURIComponent(artist)}`;
-        const lrRes = await fetch(lrcUrl, {
-          headers: { 'User-Agent': 'RiriPlayer/1.0' },
-          signal: AbortSignal.timeout(6000),
+    try {
+      const entry = await lyricsServerCache.resolve(
+        cacheKey,
+        ttlForResult,
+        async (generation) =>
+          (await fetchFirstServerLyricsProvider(
+            enabledProviders,
+            title,
+            artist,
+            videoId,
+            duration,
+            gl,
+            hl,
+            requestController.signal,
+            (upgraded) => {
+              if (upgraded.syncedLyrics) {
+                // A late result from an older request must not overwrite a
+                // newer forced refresh for the same track.
+                lyricsServerCache.set(
+                  cacheKey,
+                  upgraded,
+                  ttlForResult,
+                  generation,
+                );
+              }
+            },
+          )) || {
+            ok: false,
+            syncedLyrics: '',
+            plainLyrics: '',
+            provider: 'none',
+            source: '',
+          },
+        { forceRefresh },
+      );
+      if (requestController.signal.aborted) return;
+      res.setHeader('X-Lyrics-Cache', entry.status);
+      res.json(entry.value);
+    } catch (error) {
+      if (!requestController.signal.aborted) {
+        res.status(500).json({
+          ok: false,
+          syncedLyrics: '',
+          plainLyrics: '',
+          provider: 'none',
+          source: '',
+          error: error instanceof Error ? error.message : 'Lyrics lookup failed.',
         });
-        if (lrRes.ok) {
-          const data = (await lrRes.json()) as {
-            syncedLyrics?: string;
-            plainLyrics?: string;
-          };
-          if (data.syncedLyrics || data.plainLyrics) {
-            res.json({
-              ok: true,
-              syncedLyrics: data.syncedLyrics || '',
-              plainLyrics: data.plainLyrics || '',
-              source: 'LRCLIB',
-            });
-            return;
-          }
-        }
-      } catch {
-        // fall through to YouTube Music lyrics
       }
+    } finally {
+      req.off('aborted', abortProviders);
     }
-
-    if (videoId) {
-      const ytmLyrics = await fetchYtmLyrics({
-        videoId,
-        gl: String(req.query.gl || 'US'),
-        hl: String(req.query.hl || 'en'),
-      }).catch(() => ({}));
-      if ('plainLyrics' in ytmLyrics && ytmLyrics.plainLyrics) {
-        res.json({ ok: true, plainLyrics: ytmLyrics.plainLyrics, source: 'YouTube Music' });
-        return;
-      }
-    }
-
-    res.json({ ok: false, syncedLyrics: '', plainLyrics: '' });
   });
 
   app.get('/api/sponsorblock', async (req, res) => {
@@ -1416,6 +1941,77 @@ export async function startAppServer(opts: StartAppServerOptions = {}): Promise<
       res.json({ ok: true, translations: combined.split('\n') });
     } catch {
       res.json({ ok: false, translations: [] });
+    }
+  });
+
+  app.post('/api/transliterate-lyrics', async (req, res) => {
+    const lines = Array.isArray(req.body?.lines) ? (req.body.lines as string[]) : [];
+    if (lines.length === 0) {
+      res.json({ ok: true, transliteration: [], hasAlternateLanguage: false });
+      return;
+    }
+    try {
+      const joined = lines.slice(0, 120).join('\n');
+      const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&dt=rm&q=${encodeURIComponent(joined)}`;
+      const trRes = await fetch(url, { signal: AbortSignal.timeout(8000) });
+      if (trRes.ok) {
+        const parsed = (await trRes.json()) as unknown[];
+        const detectedLang = typeof parsed?.[2] === 'string' ? parsed[2] : '';
+        const isAlreadyEnglish = detectedLang.toLowerCase().startsWith('en');
+
+        // Check for romanized lyrics block (dt=rm gives transliterated pronunciation)
+        let romanizedLines: string[] | null = null;
+        if (Array.isArray(parsed?.[0])) {
+          const blocks = parsed[0] as unknown[];
+          // The last block often contains [null, null, null, "Romanized string"]
+          for (let i = blocks.length - 1; i >= 0; i--) {
+            const block = blocks[i] as unknown[];
+            if (Array.isArray(block) && typeof block[3] === 'string' && block[3].trim()) {
+              romanizedLines = block[3].split('\n').map((l) => l.trim());
+              break;
+            }
+          }
+
+          // If no romanized block, use translated English lines
+          if (!romanizedLines || romanizedLines.length === 0) {
+            const translatedText = blocks
+              .filter((b) => Array.isArray(b) && typeof (b as unknown[])[0] === 'string')
+              .map((b) => (b as unknown[])[0] as string)
+              .join('');
+            if (translatedText.trim()) {
+              romanizedLines = translatedText.split('\n').map((l) => l.trim());
+            }
+          }
+        }
+
+        if (romanizedLines && romanizedLines.length > 0) {
+          // Pad or align to original line count if necessary
+          const finalLines = lines.map((original, idx) => romanizedLines![idx] || original);
+          res.json({
+            ok: true,
+            transliteration: finalLines,
+            hasAlternateLanguage: !isAlreadyEnglish,
+            detectedLang,
+          });
+          return;
+        }
+      }
+
+      // Offline fallback: use local regex transliteration
+      const localTransliterated = transliterateLyrics(lines);
+      res.json({
+        ok: true,
+        transliteration: localTransliterated,
+        hasAlternateLanguage: true,
+      });
+    } catch {
+      // Local fallback on network error
+      const localTransliterated = transliterateLyrics(lines);
+      res.json({
+        ok: true,
+        transliteration: localTransliterated,
+        hasAlternateLanguage: true,
+      });
     }
   });
 
@@ -1504,4 +2100,4 @@ if (
 }
 
 // Need to import these from electron/ytm/spotify
-import { getSpotifyStatus, logoutSpotifyAccount, resolveManualSpotifyTrackList, setSpotifySyncSchedule, syncSpotifyLibraryToYtm } from './electron/ytm/spotify';
+import { getSpotifyStatus, getSpotifySyncProgress, logoutSpotifyAccount, resolveManualSpotifyTrackList, setSpotifySyncSchedule, syncSpotifyLibraryToYtm } from './electron/ytm/spotify';

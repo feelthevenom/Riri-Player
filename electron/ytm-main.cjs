@@ -216,6 +216,40 @@ function parseInnertubeNext(json) {
   }
   return null;
 }
+function upgradeThumbnailUrl(rawUrl) {
+  if (!rawUrl) return rawUrl;
+  let upgraded = rawUrl.trim();
+  if (/^https?:\/\/(lh3\.googleusercontent\.com|yt3\.ggpht\.com|yt3\.googleusercontent\.com)\//i.test(upgraded)) {
+    if (/=w\d+-h\d+/i.test(upgraded)) {
+      upgraded = upgraded.replace(/=w\d+-h\d+([^?\s]*)/i, (_m, rest) => {
+        const updatedRest = String(rest || "").replace(/-l\d+/i, "-l100");
+        return `=w1200-h1200${updatedRest}`;
+      });
+    } else if (/=s\d+/i.test(upgraded)) {
+      upgraded = upgraded.replace(/=s\d+/i, "=s1200");
+    }
+  } else if (/^https?:\/\/i\d*\.ytimg\.com\/vi(?:_webp)?\/[^/]+\/(?:default|mqdefault|hqdefault|sddefault)\.(jpg|webp)/i.test(upgraded)) {
+    upgraded = upgraded.replace(
+      /\/(default|mqdefault|hqdefault|sddefault)\.(jpg|webp)/i,
+      "/maxresdefault.$2"
+    );
+  }
+  return upgraded;
+}
+function pickBestThumbnailUrl(thumbs) {
+  if (!Array.isArray(thumbs) || thumbs.length === 0) return "";
+  let best = thumbs[thumbs.length - 1];
+  let bestArea = (best?.width || 0) * (best?.height || 0);
+  for (const t of thumbs) {
+    const area = (t?.width || 0) * (t?.height || 0);
+    if (t?.url && area > bestArea) {
+      best = t;
+      bestArea = area;
+    }
+  }
+  const raw = String(best?.url || thumbs[0]?.url || "");
+  return raw ? upgradeThumbnailUrl(raw) : "";
+}
 function parsePlaylistPanelVideoRenderer(renderer) {
   const videoId = renderer.videoId || "";
   if (!videoId) return null;
@@ -255,8 +289,8 @@ function parsePlaylistPanelVideoRenderer(renderer) {
   const lengthText = (lengthRuns ? lengthRuns.map((r) => String(r.text || "")).join("").trim() : "") || String(renderer.lengthText?.simpleText || "") || "3:00";
   const durationSec = parseDurationTextToSec(lengthText);
   const thumbnail = renderer.thumbnail?.thumbnails || [];
-  const rawThumb = thumbnail.length > 0 ? String(thumbnail[thumbnail.length - 1].url || thumbnail[0].url || "") : "";
-  const thumbSource = rawThumb || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+  const rawThumb = pickBestThumbnailUrl(thumbnail);
+  const thumbSource = rawThumb || `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`;
   const thumbnailUrl = `/api/proxy-image?url=${encodeURIComponent(thumbSource)}`;
   const streamParams = new URLSearchParams({
     videoId,
@@ -359,7 +393,7 @@ function normalizeTrackFromListItem(r) {
     durationSec = parseDurationTextToSec(fixedDur);
   }
   const thumbs = r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || rAny.thumbnail?.thumbnails || [];
-  const bestThumb = thumbs[thumbs.length - 1]?.url || thumbs[0]?.url || "";
+  const bestThumb = pickBestThumbnailUrl(thumbs);
   const proxiedArt = bestThumb ? `/api/proxy-image?url=${encodeURIComponent(bestThumb)}` : "";
   if (rAny.lengthSeconds && !isNaN(parseInt(rAny.lengthSeconds, 10))) {
     durationSec = parseInt(rAny.lengthSeconds, 10);
@@ -428,7 +462,7 @@ function normalizeTwoRowCard(item, fallbackKind = "playlist") {
   if (!title) return null;
   const subtitle = (item.subtitle?.runs || []).map((r) => r.text || "").join("").replace(/\s+/g, " ").trim();
   const thumbs = item.thumbnailRenderer?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
-  const rawThumb = thumbs[thumbs.length - 1]?.url || thumbs[0]?.url || "";
+  const rawThumb = pickBestThumbnailUrl(thumbs);
   const thumbnailUrl = rawThumb ? `/api/proxy-image?url=${encodeURIComponent(rawThumb)}` : "";
   const browseId = item.navigationEndpoint?.browseEndpoint?.browseId;
   const params = item.navigationEndpoint?.browseEndpoint?.params;
@@ -505,7 +539,7 @@ function normalizeBrowseCardFromListItem(r, fallbackKind = "playlist") {
   if (!title) return null;
   const subtitle = [...flex1, ...flex2].map((x2) => x2.text || "").join("").replace(/\s+/g, " ").trim();
   const thumbs = r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || rAny.thumbnail?.thumbnails || [];
-  const rawThumb = thumbs[thumbs.length - 1]?.url || thumbs[0]?.url || "";
+  const rawThumb = pickBestThumbnailUrl(thumbs);
   const thumbnailUrl = rawThumb ? `/api/proxy-image?url=${encodeURIComponent(rawThumb)}` : "";
   const rootNav = r.navigationEndpoint || rAny.navigationEndpoint;
   const flex0Nav = flex0[0]?.navigationEndpoint;
@@ -558,7 +592,7 @@ function parseInnertubeBrowseCards(json, fallbackKind = "playlist") {
       const subtitleRuns = cardShelf.subtitle?.runs || [];
       const subtitle = subtitleRuns.map((r) => r.text || "").join("").replace(/\s+/g, " ").trim();
       const thumbs = cardShelf.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
-      const rawThumb = thumbs[thumbs.length - 1]?.url || thumbs[0]?.url || "";
+      const rawThumb = pickBestThumbnailUrl(thumbs);
       const thumbnailUrl = rawThumb ? `/api/proxy-image?url=${encodeURIComponent(rawThumb)}` : "";
       const nav = titleRuns[0]?.navigationEndpoint;
       const rawBrowseId = nav?.browseEndpoint?.browseId;
@@ -859,6 +893,12 @@ function hasYouTubeLoginCookie(cookie) {
   );
   return hasSapisid && hasSessionId;
 }
+function hasResidualYouTubeAuthCookie(cookie) {
+  if (!cookie || typeof cookie !== "string") return false;
+  return Boolean(
+    extractSapisidFromCookie(cookie) || extractCookieValue(cookie, "__Secure-1PAPISID") || extractCookieValue(cookie, "__Secure-3PAPISID") || extractCookieValue(cookie, "SID") || extractCookieValue(cookie, "__Secure-3PSID") || extractCookieValue(cookie, "__Secure-1PSID") || extractCookieValue(cookie, "LOGIN_INFO")
+  );
+}
 function computeSapisidHash(cookie, origin = ORIGIN_YOUTUBE_MUSIC) {
   const sapisid = extractSapisidFromCookie(cookie);
   if (!sapisid) return null;
@@ -936,20 +976,123 @@ var import_node_fs = __toESM(require("node:fs"), 1);
 var import_node_os = __toESM(require("node:os"), 1);
 var import_node_path = __toESM(require("node:path"), 1);
 var import_node_crypto2 = __toESM(require("node:crypto"), 1);
+var LEGACY_YTM_PARTITION = "persist:ytm-login";
+var YtVaultUnreadableError = class extends Error {
+  diagnostic;
+  constructor(diagnostic) {
+    const detail = diagnostic.error?.trim();
+    const message = detail?.startsWith("Session vault is unreadable;") ? detail : detail ? `Session vault is unreadable; refusing to treat the account as signed out. ${detail}` : "Session vault is unreadable; refusing to treat the account as signed out.";
+    super(message);
+    this.name = "YtVaultUnreadableError";
+    this.diagnostic = { ...diagnostic, unreadableFile: true };
+  }
+};
+var YtAccountStateConflictError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "YtAccountStateConflictError";
+  }
+};
+var YtSessionInvalidatedError = class extends Error {
+  constructor(message = "The persistent YouTube Music session was invalidated by logout.") {
+    super(message);
+    this.name = "YtSessionInvalidatedError";
+  }
+};
+var YtAccountNotFoundError = class extends Error {
+  constructor(accountId) {
+    super(`YouTube Music account ${accountId} was not found.`);
+    this.name = "YtAccountNotFoundError";
+  }
+};
+var YtAuthOperationCancelledError = class extends Error {
+  constructor(message = "The YouTube Music authentication operation was cancelled.") {
+    super(message);
+    this.name = "YtAuthOperationCancelledError";
+  }
+};
+var YtResetPendingError = class extends Error {
+  constructor(message = "A YouTube Music factory reset is still in progress.") {
+    super(message);
+    this.name = "YtResetPendingError";
+  }
+};
 var DEFAULT_VAULT = {
   ytAccounts: [],
   activeYtAccountId: null,
   anonymousVisitorData: "",
-  spotify: null
+  spotify: null,
+  ytPartitionTombstone: null,
+  ytPartitionTombstones: [],
+  ytResetPending: null
 };
-var cachedVault = null;
-var electronBridge = {};
+function detectElectronCredentialStorage() {
+  if (!process.versions.electron) return {};
+  try {
+    const runtimeRequire = typeof require === "function" ? require : null;
+    if (!runtimeRequire) return {};
+    const electronModuleName = "electron";
+    const electron = runtimeRequire(electronModuleName);
+    if (!electron.app?.getPath || !electron.safeStorage) return {};
+    return {
+      userDataPath: electron.app.getPath("userData"),
+      safeStorage: electron.safeStorage
+    };
+  } catch {
+    return {};
+  }
+}
+var CREDENTIAL_STORE_REGISTRY_KEY = /* @__PURE__ */ Symbol.for(
+  "riri-player.ytm.credential-store.v1"
+);
+function createCredentialStoreState() {
+  return {
+    electronBridge: detectElectronCredentialStorage(),
+    cachedVault: null,
+    vaultCacheValid: false,
+    vaultDiagnostic: null,
+    vaultOperationQueue: Promise.resolve(),
+    vaultReencryptScheduled: false
+  };
+}
+function getCredentialStoreState() {
+  const registry = globalThis;
+  const existing = registry[CREDENTIAL_STORE_REGISTRY_KEY];
+  if (existing && typeof existing === "object" && "electronBridge" in existing && "vaultOperationQueue" in existing) {
+    const state = existing;
+    if (!state.electronBridge || typeof state.electronBridge !== "object") {
+      state.electronBridge = {};
+    }
+    const detected = detectElectronCredentialStorage();
+    if (detected.userDataPath && !state.electronBridge.userDataPath) {
+      state.electronBridge = {
+        ...detected,
+        ...state.electronBridge
+      };
+    }
+    return state;
+  }
+  const created = createCredentialStoreState();
+  registry[CREDENTIAL_STORE_REGISTRY_KEY] = created;
+  return created;
+}
+var credentialStore = getCredentialStoreState();
+function enqueueVaultOperation(operation) {
+  const result = credentialStore.vaultOperationQueue.then(operation, operation);
+  credentialStore.vaultOperationQueue = result.then(
+    () => void 0,
+    () => void 0
+  );
+  return result;
+}
 function configureCredentialStorage(opts) {
-  electronBridge = opts;
-  cachedVault = null;
+  credentialStore.electronBridge = opts;
+  credentialStore.cachedVault = null;
+  credentialStore.vaultCacheValid = false;
+  credentialStore.vaultDiagnostic = null;
 }
 function getVaultFilePath() {
-  const baseDir = electronBridge.userDataPath || import_node_path.default.join(import_node_os.default.homedir(), ".riri-player");
+  const baseDir = credentialStore.electronBridge.userDataPath || import_node_path.default.join(import_node_os.default.homedir(), ".riri-player");
   try {
     if (!import_node_fs.default.existsSync(baseDir)) {
       import_node_fs.default.mkdirSync(baseDir, { recursive: true, mode: 448 });
@@ -985,25 +1128,188 @@ function decryptFallback(encoded) {
   ]);
   return dec.toString("utf8");
 }
-async function readVault() {
-  if (cachedVault) return cachedVault;
+function getSafeStoragePlaintext(decrypted) {
+  if (typeof decrypted === "string") return decrypted;
+  if (decrypted && typeof decrypted.result === "string" && decrypted.result.length > 0) {
+    return decrypted.result;
+  }
+  throw new Error("SafeStorage returned an invalid decrypted value.");
+}
+async function decryptVaultBuffer(buf) {
+  const ss = credentialStore.electronBridge.safeStorage;
+  if (ss?.decryptStringAsync) {
+    let lastErr = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const decrypted = await ss.decryptStringAsync(buf);
+        if (typeof decrypted === "string") {
+          return { plaintext: decrypted, shouldReEncrypt: false };
+        }
+        if (decrypted && typeof decrypted.result === "string") {
+          return {
+            plaintext: getSafeStoragePlaintext(decrypted),
+            shouldReEncrypt: Boolean(decrypted.shouldReEncrypt)
+          };
+        }
+        throw new Error("SafeStorage returned an invalid decrypted value.");
+      } catch (err2) {
+        lastErr = err2;
+        await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+      }
+    }
+    throw lastErr;
+  }
+  if (ss?.isEncryptionAvailable && ss.decryptString && ss.isEncryptionAvailable()) {
+    return { plaintext: ss.decryptString(buf), shouldReEncrypt: false };
+  }
+  throw new Error("Encryption is not available.");
+}
+function normalizePartitionTombstone(value) {
+  if (!value || typeof value !== "object") return null;
+  const tombstone = value;
+  if (typeof tombstone.generation !== "number" || !Number.isFinite(tombstone.generation) || typeof tombstone.invalidatedAt !== "number" || !Number.isFinite(tombstone.invalidatedAt)) {
+    return null;
+  }
+  const partitionName = typeof tombstone.partitionName === "string" && tombstone.partitionName.trim() ? tombstone.partitionName.trim() : LEGACY_YTM_PARTITION;
+  return {
+    generation: tombstone.generation,
+    accountId: typeof tombstone.accountId === "string" ? tombstone.accountId : null,
+    invalidatedAt: tombstone.invalidatedAt,
+    partitionName
+  };
+}
+function latestPartitionTombstone(tombstones) {
+  if (tombstones.length === 0) return null;
+  return tombstones.reduce(
+    (latest, tombstone) => tombstone.generation > latest.generation ? tombstone : latest
+  );
+}
+function dedupePartitionTombstones(tombstones) {
+  const byPartition = /* @__PURE__ */ new Map();
+  for (const tombstone of tombstones) {
+    const partitionName = tombstone.partitionName || LEGACY_YTM_PARTITION;
+    const normalized = { ...tombstone, partitionName };
+    const previous = byPartition.get(partitionName);
+    if (!previous || normalized.generation > previous.generation) {
+      byPartition.set(partitionName, normalized);
+    }
+  }
+  return Array.from(byPartition.values()).sort(
+    (left, right) => left.generation - right.generation
+  );
+}
+function normalizeYtResetPending(value) {
+  if (!value || typeof value !== "object") return null;
+  const pending = value;
+  if (typeof pending.generation !== "number" || !Number.isFinite(pending.generation) || typeof pending.startedAt !== "number" || !Number.isFinite(pending.startedAt)) {
+    return null;
+  }
+  const accountIds = Array.isArray(pending.accountIds) ? pending.accountIds.filter((id) => typeof id === "string" && Boolean(id)) : [];
+  const partitionNames = Array.isArray(pending.partitionNames) ? pending.partitionNames.filter(
+    (name) => typeof name === "string" && Boolean(name.trim())
+  ) : [];
+  return {
+    generation: pending.generation,
+    accountIds,
+    partitionNames: partitionNames.map((name) => name.trim()),
+    startedAt: pending.startedAt
+  };
+}
+function getTombstoneRegistryPath() {
+  return `${getVaultFilePath()}.tombstones.json`;
+}
+function readCredentialSidecar() {
+  try {
+    const registryPath = getTombstoneRegistryPath();
+    if (!import_node_fs.default.existsSync(registryPath)) {
+      return { tombstones: [], resetPending: null };
+    }
+    const parsed = JSON.parse(import_node_fs.default.readFileSync(registryPath, "utf8"));
+    const tombstones = Array.isArray(parsed.tombstones) ? dedupePartitionTombstones(
+      parsed.tombstones.map(normalizePartitionTombstone).filter((tombstone) => Boolean(tombstone))
+    ) : [];
+    return {
+      tombstones,
+      resetPending: normalizeYtResetPending(parsed.resetPending)
+    };
+  } catch {
+    return { tombstones: [], resetPending: null };
+  }
+}
+function writeCredentialSidecar(tombstones, resetPending) {
+  const registryPath = getTombstoneRegistryPath();
+  const normalized = dedupePartitionTombstones(tombstones).map((tombstone) => ({
+    ...tombstone,
+    // Account IDs may contain an email address. They are not needed for
+    // partition recovery, so keep the sidecar metadata-only.
+    accountId: null
+  }));
+  const sanitizedResetPending = resetPending ? { ...resetPending, accountIds: [] } : null;
+  const tempPath = `${registryPath}.${process.pid}.${import_node_crypto2.default.randomBytes(6).toString("hex")}.tmp`;
+  try {
+    import_node_fs.default.writeFileSync(
+      tempPath,
+      JSON.stringify({ version: 2, tombstones: normalized, resetPending: sanitizedResetPending }),
+      { encoding: "utf8", mode: 384 }
+    );
+    import_node_fs.default.renameSync(tempPath, registryPath);
+  } catch (err2) {
+    try {
+      import_node_fs.default.rmSync(tempPath, { force: true });
+    } catch {
+    }
+    throw err2;
+  }
+}
+function readTombstoneRegistry() {
+  return readCredentialSidecar().tombstones;
+}
+function writeTombstoneRegistry(tombstones) {
+  const sidecar = readCredentialSidecar();
+  writeCredentialSidecar(tombstones, sidecar.resetPending);
+}
+function mergePartitionTombstones(...sources) {
+  return dedupePartitionTombstones(sources.flat());
+}
+async function readVaultUnlocked() {
+  if (credentialStore.vaultCacheValid && credentialStore.cachedVault) {
+    credentialStore.vaultDiagnostic = null;
+    return { vault: credentialStore.cachedVault, unreadable: false };
+  }
   const filePath = getVaultFilePath();
   if (!import_node_fs.default.existsSync(filePath)) {
-    cachedVault = { ...DEFAULT_VAULT };
-    return cachedVault;
+    const sidecar = readCredentialSidecar();
+    const latestTombstone = latestPartitionTombstone(sidecar.tombstones);
+    credentialStore.vaultDiagnostic = null;
+    return {
+      vault: {
+        ...DEFAULT_VAULT,
+        ytPartitionTombstone: latestTombstone,
+        ytPartitionTombstones: sidecar.tombstones,
+        ytResetPending: sidecar.resetPending
+      },
+      unreadable: false
+    };
   }
+  credentialStore.vaultDiagnostic = null;
   try {
     const raw = import_node_fs.default.readFileSync(filePath, "utf8").trim();
     let jsonStr = "";
+    let shouldReEncrypt = false;
     if (raw.startsWith("SAFE:")) {
-      const ss = electronBridge.safeStorage;
       const buf = Buffer.from(raw.slice(5), "base64");
-      if (ss?.isAsyncEncryptionAvailable && ss.decryptStringAsync && await ss.isAsyncEncryptionAvailable()) {
-        jsonStr = await ss.decryptStringAsync(buf);
-      } else if (ss?.isEncryptionAvailable && ss.decryptString && ss.isEncryptionAvailable()) {
-        jsonStr = ss.decryptString(buf);
-      } else {
-        return { ...DEFAULT_VAULT };
+      try {
+        const decrypted = await decryptVaultBuffer(buf);
+        jsonStr = decrypted.plaintext;
+        shouldReEncrypt = decrypted.shouldReEncrypt;
+      } catch (err2) {
+        credentialStore.vaultDiagnostic = {
+          error: err2 instanceof Error ? err2.message : "Failed to decrypt session vault.",
+          unreadableFile: true
+        };
+        credentialStore.vaultCacheValid = false;
+        credentialStore.cachedVault = null;
+        return { vault: { ...DEFAULT_VAULT }, unreadable: true };
       }
     } else if (raw.startsWith("AES:")) {
       jsonStr = decryptFallback(raw);
@@ -1011,108 +1317,158 @@ async function readVault() {
       jsonStr = raw;
     }
     const parsed = JSON.parse(jsonStr);
-    cachedVault = {
-      ytAccounts: Array.isArray(parsed.ytAccounts) ? parsed.ytAccounts : [],
+    const legacyTombstone = normalizePartitionTombstone(parsed.ytPartitionTombstone);
+    const parsedTombstones = Array.isArray(parsed.ytPartitionTombstones) ? parsed.ytPartitionTombstones.map(normalizePartitionTombstone).filter((tombstone) => Boolean(tombstone)) : [];
+    const tombstones = mergePartitionTombstones(
+      parsedTombstones,
+      legacyTombstone ? [legacyTombstone] : [],
+      readTombstoneRegistry()
+    );
+    const latestTombstone = latestPartitionTombstone(tombstones);
+    credentialStore.cachedVault = {
+      ytAccounts: Array.isArray(parsed.ytAccounts) ? parsed.ytAccounts.filter(
+        (account) => Boolean(account && typeof account === "object")
+      ).map((account) => {
+        const { partitionName, ...rest } = account;
+        return typeof partitionName === "string" && partitionName.trim() ? { ...rest, partitionName: partitionName.trim() } : rest;
+      }) : [],
       activeYtAccountId: parsed.activeYtAccountId || null,
       anonymousVisitorData: parsed.anonymousVisitorData || "",
-      spotify: parsed.spotify || null
+      spotify: parsed.spotify || null,
+      ytPartitionTombstone: latestTombstone,
+      ytPartitionTombstones: tombstones,
+      ytResetPending: normalizeYtResetPending(parsed.ytResetPending)
     };
-    return cachedVault;
-  } catch {
-    cachedVault = { ...DEFAULT_VAULT };
-    return cachedVault;
+    credentialStore.vaultCacheValid = true;
+    credentialStore.vaultDiagnostic = null;
+    if (shouldReEncrypt && !credentialStore.vaultReencryptScheduled) {
+      credentialStore.vaultReencryptScheduled = true;
+      void enqueueVaultOperation(async () => {
+        const current = await readVaultUnlocked();
+        if (current.unreadable) {
+          throw new Error("Session vault became unreadable during key rotation.");
+        }
+        await writeVault(current.vault);
+      }).catch((err2) => {
+        console.warn(
+          "[YTM Auth] Could not re-encrypt the rotated session vault:",
+          err2 instanceof Error ? err2.message : String(err2)
+        );
+      }).finally(() => {
+        credentialStore.vaultReencryptScheduled = false;
+      });
+    }
+    return { vault: credentialStore.cachedVault, unreadable: false };
+  } catch (err2) {
+    credentialStore.vaultDiagnostic = {
+      error: err2 instanceof Error ? err2.message : "Failed to read session vault.",
+      unreadableFile: true
+    };
+    credentialStore.vaultCacheValid = false;
+    credentialStore.cachedVault = null;
+    return { vault: { ...DEFAULT_VAULT }, unreadable: true };
   }
 }
-async function writeVault(vault) {
-  cachedVault = vault;
+async function readVault() {
+  const result = await enqueueVaultOperation(() => readVaultUnlocked());
+  if (result.unreadable) {
+    throw new YtVaultUnreadableError(
+      credentialStore.vaultDiagnostic || {
+        error: "Session vault is unreadable.",
+        unreadableFile: true
+      }
+    );
+  }
+  return result.vault;
+}
+async function readVaultForMutation() {
+  const result = await readVaultUnlocked();
+  if (result.unreadable) {
+    const diagnostic = credentialStore.vaultDiagnostic || { unreadableFile: true };
+    const detail = diagnostic.error?.trim();
+    throw new YtVaultUnreadableError({
+      ...diagnostic,
+      error: `Session vault is unreadable; refusing to overwrite the existing credentials.${detail && !detail.startsWith("Session vault is unreadable;") ? ` ${detail}` : ""}`
+    });
+  }
+  return result.vault;
+}
+async function writeVault(vault, canPublish) {
+  if (canPublish && !canPublish()) {
+    throw new YtAuthOperationCancelledError();
+  }
   const filePath = getVaultFilePath();
   const plaintext = JSON.stringify(vault);
   let serialized = "";
-  const ss = electronBridge.safeStorage;
-  if (ss?.isAsyncEncryptionAvailable && ss.encryptStringAsync && await ss.isAsyncEncryptionAvailable()) {
-    const enc = await ss.encryptStringAsync(plaintext);
-    serialized = `SAFE:${enc.toString("base64")}`;
+  const ss = credentialStore.electronBridge.safeStorage;
+  if (ss?.encryptStringAsync) {
+    let lastErr = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const enc = await ss.encryptStringAsync(plaintext);
+        if (!Buffer.isBuffer(enc) || enc.length === 0) {
+          throw new Error("SafeStorage returned an invalid encrypted value.");
+        }
+        serialized = `SAFE:${enc.toString("base64")}`;
+        break;
+      } catch (err2) {
+        lastErr = err2;
+        await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+      }
+    }
+    if (!serialized) throw lastErr;
   } else if (ss?.isEncryptionAvailable && ss.encryptString && ss.isEncryptionAvailable()) {
     const enc = ss.encryptString(plaintext);
+    if (!Buffer.isBuffer(enc) || enc.length === 0) {
+      throw new Error("SafeStorage returned an invalid encrypted value.");
+    }
     serialized = `SAFE:${enc.toString("base64")}`;
   } else {
     serialized = encryptFallback(plaintext);
   }
+  if (canPublish && !canPublish()) {
+    throw new YtAuthOperationCancelledError();
+  }
+  const tempPath = `${filePath}.${process.pid}.${import_node_crypto2.default.randomBytes(6).toString("hex")}.tmp`;
   try {
-    import_node_fs.default.writeFileSync(filePath, serialized, { encoding: "utf8", mode: 384 });
-  } catch {
+    import_node_fs.default.writeFileSync(tempPath, serialized, { encoding: "utf8", mode: 384 });
+    import_node_fs.default.renameSync(tempPath, filePath);
+  } catch (err2) {
+    try {
+      import_node_fs.default.rmSync(tempPath, { force: true });
+    } catch {
+    }
+    credentialStore.vaultCacheValid = false;
+    credentialStore.cachedVault = null;
+    throw err2;
   }
+  credentialStore.cachedVault = vault;
+  credentialStore.vaultCacheValid = true;
+  credentialStore.vaultDiagnostic = null;
 }
-async function getActiveYtAccount() {
-  const vault = await readVault();
+async function getVaultDiagnostic() {
+  if (credentialStore.vaultDiagnostic?.unreadableFile) {
+    return { ...credentialStore.vaultDiagnostic };
+  }
+  const result = await enqueueVaultOperation(() => readVaultUnlocked());
+  if (result.unreadable) {
+    return { ...credentialStore.vaultDiagnostic || { unreadableFile: true } };
+  }
+  return null;
+}
+async function invalidateVaultCache() {
+  await enqueueVaultOperation(async () => {
+    credentialStore.vaultCacheValid = false;
+    credentialStore.cachedVault = null;
+    credentialStore.vaultDiagnostic = null;
+  });
+}
+function findActiveAccount(vault) {
   if (vault.ytAccounts.length === 0) return null;
-  const found = vault.ytAccounts.find((a) => a.id === vault.activeYtAccountId);
-  return found || vault.ytAccounts[0];
+  return vault.ytAccounts.find((a) => a.id === vault.activeYtAccountId) || vault.ytAccounts[0];
 }
-async function getAnonymousVisitorData() {
-  return (await readVault()).anonymousVisitorData || "";
-}
-async function setAnonymousVisitorData(visitorData) {
-  if (!visitorData) return;
-  const vault = await readVault();
-  if (vault.anonymousVisitorData === visitorData) return;
-  await writeVault({ ...vault, anonymousVisitorData: visitorData });
-}
-async function upsertYtAccount(account) {
-  const vault = await readVault();
-  const existingIdx = vault.ytAccounts.findIndex(
-    (a) => a.id === account.id || account.email && a.email && a.email.toLowerCase() === account.email.toLowerCase()
-  );
-  const nextAccounts = [...vault.ytAccounts];
-  if (existingIdx >= 0) {
-    nextAccounts[existingIdx] = {
-      ...nextAccounts[existingIdx],
-      ...account,
-      id: nextAccounts[existingIdx].id,
-      addedAt: nextAccounts[existingIdx].addedAt
-    };
-  } else {
-    nextAccounts.unshift(account);
-  }
-  const activeId = existingIdx >= 0 ? nextAccounts[existingIdx].id : account.id;
-  await writeVault({
-    ...vault,
-    ytAccounts: nextAccounts,
-    activeYtAccountId: activeId
-  });
-  return await getPublicYtAuthStatus();
-}
-async function updateActiveYtAccountAuth(patch) {
-  const vault = await readVault();
-  const active = await getActiveYtAccount();
-  if (!active) return;
-  const nextAccounts = vault.ytAccounts.map(
-    (a) => a.id === active.id ? { ...a, ...patch } : a
-  );
-  await writeVault({ ...vault, ytAccounts: nextAccounts });
-}
-async function switchActiveYtAccount(accountId) {
-  const vault = await readVault();
-  const exists = vault.ytAccounts.find((a) => a.id === accountId);
-  if (!exists) return await getPublicYtAuthStatus();
-  await writeVault({ ...vault, activeYtAccountId: exists.id });
-  return await getPublicYtAuthStatus();
-}
-async function removeYtAccountById(accountId) {
-  const vault = await readVault();
-  const targetId = accountId || vault.activeYtAccountId;
-  const nextAccounts = vault.ytAccounts.filter((a) => a.id !== targetId);
-  const nextActive = nextAccounts.length === 0 ? null : vault.activeYtAccountId === targetId ? nextAccounts[0].id : vault.activeYtAccountId;
-  await writeVault({
-    ...vault,
-    ytAccounts: nextAccounts,
-    activeYtAccountId: nextActive
-  });
-  return await getPublicYtAuthStatus();
-}
-async function getPublicYtAuthStatus() {
-  const vault = await readVault();
-  const active = await getActiveYtAccount();
+function toPublicYtAuthStatus(vault) {
+  const active = findActiveAccount(vault);
   const accounts = vault.ytAccounts.map((acc) => ({
     id: acc.id,
     name: acc.name,
@@ -1129,25 +1485,297 @@ async function getPublicYtAuthStatus() {
     email: active?.email || active?.handle || "",
     avatar: active?.avatarUrl || "",
     accountIndex: active?.accountIndex ?? 0,
+    activeAccountId: active?.id || null,
     visitorData: active?.visitorData || vault.anonymousVisitorData || "",
     accounts
   };
 }
+async function getActiveYtAccount() {
+  return findActiveAccount(await readVault());
+}
+async function getYtAccountById(accountId) {
+  const vault = await readVault();
+  return vault.ytAccounts.find((account) => account.id === accountId) || null;
+}
+async function getAnonymousVisitorData() {
+  return (await readVault()).anonymousVisitorData || "";
+}
+async function setAnonymousVisitorData(visitorData) {
+  if (!visitorData) return;
+  await enqueueVaultOperation(async () => {
+    const vault = await readVaultForMutation();
+    if (vault.anonymousVisitorData === visitorData) return;
+    await writeVault({ ...vault, anonymousVisitorData: visitorData });
+  });
+}
+async function upsertYtAccount(account, options = {}) {
+  return await enqueueVaultOperation(async () => {
+    const vault = await readVaultForMutation();
+    if (vault.ytResetPending) {
+      throw new YtResetPendingError();
+    }
+    if (options.canPublish && !options.canPublish()) {
+      throw new YtAuthOperationCancelledError();
+    }
+    const currentActive = findActiveAccount(vault);
+    if (Object.prototype.hasOwnProperty.call(options, "expectedActiveAccountId") && (currentActive?.id || null) !== options.expectedActiveAccountId) {
+      throw new YtAccountStateConflictError(
+        "The active YouTube Music account changed while the recovered session was being imported."
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(options, "expectedActiveAccountCookie") && currentActive && currentActive.cookie !== options.expectedActiveAccountCookie) {
+      throw new YtAccountStateConflictError(
+        "The active YouTube Music credentials changed while the recovered session was being imported."
+      );
+    }
+    const source = options.source || "explicit";
+    const accountPartition = account.partitionName?.trim() || LEGACY_YTM_PARTITION;
+    const partitionTombstone = vault.ytPartitionTombstones.find(
+      (tombstone) => (tombstone.partitionName || null) === accountPartition
+    );
+    if (source === "partition-restore" && partitionTombstone) {
+      throw new YtSessionInvalidatedError(
+        "The persistent YouTube Music session was invalidated by logout and cannot be restored automatically."
+      );
+    }
+    const existingIdx = vault.ytAccounts.findIndex(
+      (a) => a.id === account.id || account.email && a.email && a.email.toLowerCase() === account.email.toLowerCase()
+    );
+    const nextAccounts = [...vault.ytAccounts];
+    if (existingIdx >= 0) {
+      nextAccounts[existingIdx] = {
+        ...nextAccounts[existingIdx],
+        ...account,
+        id: nextAccounts[existingIdx].id,
+        addedAt: nextAccounts[existingIdx].addedAt
+      };
+    } else {
+      nextAccounts.unshift(account);
+    }
+    const importedId = existingIdx >= 0 ? nextAccounts[existingIdx].id : account.id;
+    const activeId = options.activate === false ? vault.activeYtAccountId : importedId;
+    const nextTombstones = source === "explicit" ? vault.ytPartitionTombstones.filter(
+      (tombstone) => (tombstone.partitionName || null) !== accountPartition
+    ) : vault.ytPartitionTombstones;
+    const latestTombstone = latestPartitionTombstone(nextTombstones);
+    const nextVault = {
+      ...vault,
+      ytAccounts: nextAccounts,
+      activeYtAccountId: activeId,
+      ytPartitionTombstone: latestTombstone,
+      ytPartitionTombstones: nextTombstones
+    };
+    if (source === "explicit" && nextTombstones.length !== vault.ytPartitionTombstones.length) {
+      writeTombstoneRegistry(nextTombstones);
+    }
+    await writeVault(nextVault, options.canPublish);
+    if (options.canPublish && !options.canPublish()) {
+      await writeVault(vault);
+      throw new YtAuthOperationCancelledError();
+    }
+    options.onCommitted?.();
+    return toPublicYtAuthStatus(nextVault);
+  });
+}
+async function markYtPartitionInvalidated(accountId, partitionName) {
+  return await enqueueVaultOperation(async () => {
+    const vault = await readVaultForMutation();
+    const normalizedPartition = partitionName?.trim() || LEGACY_YTM_PARTITION;
+    const previousGeneration = vault.ytPartitionTombstones.reduce(
+      (max2, tombstone2) => Math.max(max2, tombstone2.generation),
+      vault.ytPartitionTombstone?.generation || 0
+    );
+    const tombstone = {
+      generation: previousGeneration + 1,
+      accountId: accountId || null,
+      invalidatedAt: Date.now(),
+      ...normalizedPartition ? { partitionName: normalizedPartition } : {}
+    };
+    const nextTombstones = [
+      ...vault.ytPartitionTombstones.filter(
+        (entry) => (entry.partitionName || null) !== normalizedPartition
+      ),
+      tombstone
+    ];
+    writeCredentialSidecar(nextTombstones, vault.ytResetPending);
+    await writeVault({
+      ...vault,
+      ytPartitionTombstone: tombstone,
+      ytPartitionTombstones: nextTombstones
+    });
+    return tombstone;
+  });
+}
+async function getYtPartitionTombstone(partitionName) {
+  const vault = await readVault();
+  if (partitionName === void 0) {
+    return vault.ytPartitionTombstone;
+  }
+  const normalizedPartition = partitionName?.trim() || LEGACY_YTM_PARTITION;
+  return vault.ytPartitionTombstones.find(
+    (tombstone) => tombstone.partitionName === normalizedPartition
+  ) || null;
+}
+async function updateActiveYtAccountAuth(patch, expectedAccountId) {
+  return await enqueueVaultOperation(async () => {
+    const vault = await readVaultForMutation();
+    if (vault.ytResetPending) throw new YtResetPendingError();
+    const active = findActiveAccount(vault);
+    if (!active) return false;
+    if (expectedAccountId && active.id !== expectedAccountId) return false;
+    const nextAccounts = vault.ytAccounts.map(
+      (a) => a.id === active.id ? { ...a, ...patch } : a
+    );
+    await writeVault({ ...vault, ytAccounts: nextAccounts });
+    return true;
+  });
+}
+async function switchActiveYtAccount(accountId) {
+  return await enqueueVaultOperation(async () => {
+    const vault = await readVaultForMutation();
+    if (vault.ytResetPending) throw new YtResetPendingError();
+    const exists = vault.ytAccounts.find((a) => a.id === accountId);
+    if (!exists) throw new YtAccountNotFoundError(accountId);
+    const nextVault = { ...vault, activeYtAccountId: exists.id };
+    await writeVault(nextVault);
+    return toPublicYtAuthStatus(nextVault);
+  });
+}
+async function getAllYtAccounts() {
+  return [...(await readVault()).ytAccounts];
+}
+async function stageYtAuthReset() {
+  return await enqueueVaultOperation(async () => {
+    const vault = await readVaultForMutation();
+    if (vault.ytResetPending) {
+      writeCredentialSidecar(vault.ytPartitionTombstones, vault.ytResetPending);
+      return vault.ytResetPending;
+    }
+    const accountIds = vault.ytAccounts.map((account) => account.id);
+    const partitionNames = Array.from(
+      /* @__PURE__ */ new Set([
+        LEGACY_YTM_PARTITION,
+        ...vault.ytAccounts.map(
+          (account) => account.partitionName?.trim() || LEGACY_YTM_PARTITION
+        )
+      ])
+    );
+    let generation = vault.ytPartitionTombstones.reduce(
+      (max2, tombstone) => Math.max(max2, tombstone.generation),
+      vault.ytPartitionTombstone?.generation || 0
+    );
+    const nextTombstones = [...vault.ytPartitionTombstones];
+    for (const partitionName of partitionNames) {
+      generation += 1;
+      const account = vault.ytAccounts.find(
+        (candidate) => (candidate.partitionName?.trim() || LEGACY_YTM_PARTITION) === partitionName
+      );
+      const tombstone = {
+        generation,
+        accountId: account?.id || null,
+        invalidatedAt: Date.now(),
+        partitionName
+      };
+      nextTombstones.push(tombstone);
+    }
+    const dedupedTombstones = mergePartitionTombstones(nextTombstones);
+    const pending = {
+      generation: generation + 1,
+      accountIds,
+      partitionNames,
+      startedAt: Date.now()
+    };
+    const latestTombstone = latestPartitionTombstone(dedupedTombstones);
+    await writeVault({
+      ...vault,
+      ytAccounts: [],
+      activeYtAccountId: null,
+      ytPartitionTombstone: latestTombstone,
+      ytPartitionTombstones: dedupedTombstones,
+      ytResetPending: pending
+    });
+    writeCredentialSidecar(dedupedTombstones, pending);
+    return pending;
+  });
+}
+async function completeYtAuthReset() {
+  return await enqueueVaultOperation(async () => {
+    const vault = await readVaultForMutation();
+    if (!vault.ytResetPending) return toPublicYtAuthStatus(vault);
+    const nextVault = { ...vault, ytResetPending: null };
+    await writeVault(nextVault);
+    writeCredentialSidecar(nextVault.ytPartitionTombstones, null);
+    return toPublicYtAuthStatus(nextVault);
+  });
+}
+async function getPendingYtAuthReset() {
+  return (await readVault()).ytResetPending;
+}
+async function preflightYtVaultWrite() {
+  await enqueueVaultOperation(async () => {
+    const vault = await readVaultForMutation();
+    if (vault.ytResetPending) throw new YtResetPendingError();
+    await writeVault(vault);
+  });
+}
+async function resetYtVaultWithBackup() {
+  return await enqueueVaultOperation(async () => {
+    const filePath = getVaultFilePath();
+    let backupPath = null;
+    if (import_node_fs.default.existsSync(filePath)) {
+      backupPath = `${filePath}.unreadable-${Date.now()}-${import_node_crypto2.default.randomBytes(4).toString("hex")}.bak`;
+      import_node_fs.default.copyFileSync(filePath, backupPath, import_node_fs.default.constants.COPYFILE_EXCL);
+    }
+    const current = await readVaultUnlocked();
+    const sidecar = readCredentialSidecar();
+    const preservedTombstones = mergePartitionTombstones(
+      current.unreadable ? [] : current.vault.ytPartitionTombstones,
+      sidecar.tombstones
+    );
+    const preservedReset = current.unreadable ? sidecar.resetPending : current.vault.ytResetPending;
+    const latestTombstone = latestPartitionTombstone(preservedTombstones);
+    await writeVault({
+      ...DEFAULT_VAULT,
+      ytPartitionTombstone: latestTombstone,
+      ytPartitionTombstones: preservedTombstones,
+      ytResetPending: preservedReset
+    });
+    writeCredentialSidecar(preservedTombstones, preservedReset);
+    return { backupPath };
+  });
+}
+async function removeYtAccountById(accountId, expectedAccount) {
+  return await enqueueVaultOperation(async () => {
+    const vault = await readVaultForMutation();
+    if (vault.ytResetPending) throw new YtResetPendingError();
+    const targetId = accountId || expectedAccount?.id || vault.activeYtAccountId;
+    if (expectedAccount) {
+      const currentTarget = vault.ytAccounts.find((account) => account.id === targetId);
+      if (!currentTarget) return toPublicYtAuthStatus(vault);
+      if (currentTarget.cookie !== expectedAccount.cookie) {
+        throw new YtAccountStateConflictError(
+          "The YouTube Music account changed while logout was in progress; please retry."
+        );
+      }
+    }
+    const nextAccounts = vault.ytAccounts.filter((a) => a.id !== targetId);
+    const nextActive = nextAccounts.length === 0 ? null : vault.activeYtAccountId === targetId ? nextAccounts[0].id : vault.activeYtAccountId;
+    const nextVault = {
+      ...vault,
+      ytAccounts: nextAccounts,
+      activeYtAccountId: nextActive
+    };
+    await writeVault(nextVault);
+    return toPublicYtAuthStatus(nextVault);
+  });
+}
+async function getPublicYtAuthStatus() {
+  return toPublicYtAuthStatus(await readVault());
+}
 async function getSpotifyCredentials() {
   return (await readVault()).spotify;
 }
-async function setSpotifyCredentials(spotify) {
-  const vault = await readVault();
-  await writeVault({ ...vault, spotify });
-  return await getPublicSpotifyConnection();
-}
-async function updateSpotifyCredentials(patch) {
-  const current = await getSpotifyCredentials();
-  if (!current) return null;
-  return await setSpotifyCredentials({ ...current, ...patch });
-}
-async function getPublicSpotifyConnection() {
-  const sp = await getSpotifyCredentials();
+function toPublicSpotifyConnection(sp) {
   if (!sp || !sp.spDc) return null;
   return {
     userId: sp.userId,
@@ -1163,6 +1791,27 @@ async function getPublicSpotifyConnection() {
     unmatchedTracks: sp.unmatchedTracks || [],
     lastError: sp.lastError
   };
+}
+async function setSpotifyCredentials(spotify) {
+  return await enqueueVaultOperation(async () => {
+    const vault = await readVaultForMutation();
+    const nextVault = { ...vault, spotify };
+    await writeVault(nextVault);
+    return toPublicSpotifyConnection(nextVault.spotify);
+  });
+}
+async function updateSpotifyCredentials(patch) {
+  return await enqueueVaultOperation(async () => {
+    const vault = await readVaultForMutation();
+    const current = vault.spotify;
+    if (!current) return null;
+    const nextVault = { ...vault, spotify: { ...current, ...patch } };
+    await writeVault(nextVault);
+    return toPublicSpotifyConnection(nextVault.spotify);
+  });
+}
+async function getPublicSpotifyConnection() {
+  return toPublicSpotifyConnection(await getSpotifyCredentials());
 }
 
 // node_modules/youtubei.js/dist/src/platform/node.js
@@ -40135,12 +40784,12 @@ async function ensureVisitorData(forceRefresh = false) {
   if (existing && !forceRefresh) return existing;
   const fromYtm = await fetchVisitorDataFromSwJs("https://music.youtube.com/sw.js_data");
   if (fromYtm) {
-    setAnonymousVisitorData(fromYtm);
+    await setAnonymousVisitorData(fromYtm).catch(() => void 0);
     return fromYtm;
   }
   const fromYt = await fetchVisitorDataFromSwJs("https://www.youtube.com/sw.js_data");
   if (fromYt) {
-    setAnonymousVisitorData(fromYt);
+    await setAnonymousVisitorData(fromYt).catch(() => void 0);
     return fromYt;
   }
   try {
@@ -40150,18 +40799,27 @@ async function ensureVisitorData(forceRefresh = false) {
     });
     const vd = yt.session.context.client.visitorData;
     if (vd) {
-      setAnonymousVisitorData(vd);
+      await setAnonymousVisitorData(vd).catch(() => void 0);
       return vd;
     }
   } catch {
   }
   return existing || Utils_exports.generateRandomString(11);
 }
+var InnerTubeAuthenticationError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "InnerTubeAuthenticationError";
+  }
+};
 async function innerTubePost(opts) {
   const profile = YOUTUBE_CLIENTS[opts.clientKey || "WEB_REMIX"] || YOUTUBE_CLIENTS.WEB_REMIX;
-  const rawActive = opts.useAuth !== false ? await getActiveYtAccount() : null;
+  const rawActive = opts.useAuth !== false ? opts.accountOverride || await getActiveYtAccount() : null;
   const active = rawActive && hasYouTubeLoginCookie(rawActive.cookie) ? rawActive : null;
-  const visitorData = opts.visitorDataOverride || active?.visitorData || await ensureVisitorData();
+  if (opts.requireAuth && !active) {
+    throw new Error("YouTube Music authentication is required for this request.");
+  }
+  const visitorData = opts.visitorDataOverride || active?.visitorData || (opts.accountOverride ? "" : await ensureVisitorData());
   const effectivePoToken = opts.disablePoToken ? void 0 : opts.poToken || (active ? active.poToken : void 0);
   const context = buildInnerTubeContext(profile, {
     gl: opts.gl || "US",
@@ -40207,14 +40865,30 @@ async function innerTubePost(opts) {
     signal: AbortSignal.timeout(15e3)
   });
   if ((res.status === 401 || res.status === 403) && active && opts.retryOnAuthError !== false && refreshCookieCallback) {
-    const refreshed = await refreshCookieCallback().catch(() => false);
+    const refreshed = await refreshCookieCallback(active.id);
     if (refreshed) {
-      return await innerTubePost({ ...opts, retryOnAuthError: false });
+      const refreshedAccount = await getYtAccountById(active.id);
+      if (!refreshedAccount) {
+        throw new InnerTubeAuthenticationError(
+          `InnerTube ${opts.endpoint} authentication failed because account ${active.id} was removed during the credential refresh.`
+        );
+      }
+      return await innerTubePost({
+        ...opts,
+        accountOverride: refreshedAccount,
+        retryOnAuthError: false
+      });
     }
   }
   if (!res.ok) {
     if ((res.status === 401 || res.status === 403) && active && opts.useAuth !== false) {
-      return await innerTubePost({ ...opts, useAuth: false, disablePoToken: true });
+      if (!opts.requireAuth) {
+        return await innerTubePost({ ...opts, useAuth: false, disablePoToken: true });
+      }
+      const authErrorText = await res.text().catch(() => "");
+      throw new Error(
+        `InnerTube ${opts.endpoint} authentication failed (${res.status}): ${authErrorText.slice(0, 180)}`
+      );
     }
     const errText = await res.text().catch(() => "");
     throw new Error(`InnerTube ${opts.endpoint} failed (${res.status}): ${errText.slice(0, 180)}`);
@@ -40223,12 +40897,18 @@ async function innerTubePost(opts) {
 }
 
 // electron/ytm/auth.ts
-var YTM_PARTITION = "persist:ytm-login";
+var YTM_PARTITION = LEGACY_YTM_PARTITION;
 var YTM_LOGIN_URL = "https://accounts.google.com/ServiceLogin?service=youtube&uilel=3&passive=true&continue=" + encodeURIComponent("https://music.youtube.com/?feature=autologin") + "&hl=en";
+function getYtAccountPartition(account) {
+  return account?.partitionName?.trim() || YTM_PARTITION;
+}
+function createPendingYtPartition() {
+  return `persist:ytm-login-${import_node_crypto3.default.randomUUID()}`;
+}
 var YTM_AUTH_UA_MODE = process.env.RIRI_YTM_LOGIN_MODE === "native" ? "native" : "firefox";
 var FIREFOX_WIN_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0";
 function getAuthWindowUserAgent(ses) {
-  if (YTM_AUTH_UA_MODE === "native" && ses) {
+  if (YTM_AUTH_UA_MODE === "native" && ses && ses.getUserAgent) {
     return ses.getUserAgent();
   }
   return FIREFOX_WIN_UA;
@@ -40261,6 +40941,54 @@ function isGoogleSignInUrl(rawUrl) {
     return false;
   }
 }
+function normalizeIdentity(value) {
+  return (value || "").trim().toLowerCase();
+}
+function matchAccountIdentity(stored, menu) {
+  const storedEmail = normalizeIdentity(stored.email);
+  const menuEmail = normalizeIdentity(menu.email);
+  if (storedEmail && menuEmail) {
+    return storedEmail === menuEmail ? "match" : "different";
+  }
+  const storedHandle = normalizeIdentity(stored.handle);
+  const menuHandle = normalizeIdentity(menu.handle);
+  if (storedHandle && menuHandle) {
+    return storedHandle === menuHandle ? "match" : "different";
+  }
+  return "unknown";
+}
+function accountMenuMatchesStoredAccount(stored, menu) {
+  return matchAccountIdentity(stored, menu) === "match";
+}
+var YtmAuthRejectedError = class extends Error {
+  constructor(status) {
+    super(`YouTube Music rejected the stored session (${status}).`);
+    this.status = status;
+    this.name = "YtmAuthRejectedError";
+  }
+  status;
+};
+var YtmAuthVerificationError = class extends Error {
+  constructor(message, status) {
+    super(message);
+    this.status = status;
+    this.name = "YtmAuthVerificationError";
+  }
+  status;
+  retryable = true;
+};
+var YtmLogoutError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "YtmLogoutError";
+  }
+};
+var YtmPartitionOwnershipConflictError = class extends YtAccountStateConflictError {
+  constructor(message) {
+    super(message);
+    this.name = "YtmPartitionOwnershipConflictError";
+  }
+};
 function parseAccountMenuResponse(json) {
   const info2 = {
     accountName: "",
@@ -40306,7 +41034,7 @@ function extractDelegatedBrandPageId(dataSyncId) {
   if (!pageId || !userId) return null;
   return pageId;
 }
-async function fetchAccountMenuWithCookies(cookie, visitorData, dataSyncId, accountIndex) {
+async function fetchAccountMenuWithCookies(cookie, visitorData, dataSyncId, accountIndex, strictAuth = false) {
   const profile = YOUTUBE_CLIENTS.WEB_REMIX;
   const brandPageId = extractDelegatedBrandPageId(dataSyncId);
   const payload = {
@@ -40347,10 +41075,37 @@ async function fetchAccountMenuWithCookies(cookie, visitorData, dataSyncId, acco
     signal: AbortSignal.timeout(12e3)
   });
   if (!res.ok) {
+    if (strictAuth) {
+      if (res.status === 401) {
+        throw new YtmAuthRejectedError(res.status);
+      }
+      throw new YtmAuthVerificationError(
+        `YouTube Music account verification is temporarily unavailable (${res.status}).`,
+        res.status
+      );
+    }
     return { accountName: "", email: "", handle: "", avatarUrl: "" };
   }
-  const json = await res.json().catch(() => null);
-  return parseAccountMenuResponse(json);
+  let json = null;
+  try {
+    json = await res.json();
+  } catch (err2) {
+    if (strictAuth) {
+      throw new YtmAuthVerificationError(
+        `YouTube Music account verification returned an unreadable response${err2 instanceof Error ? `: ${err2.message}` : "."}`,
+        res.status
+      );
+    }
+    return { accountName: "", email: "", handle: "", avatarUrl: "" };
+  }
+  const menu = parseAccountMenuResponse(json);
+  if (strictAuth && !menu.accountName && !menu.email && !menu.handle) {
+    throw new YtmAuthVerificationError(
+      "YouTube Music account verification is temporarily unavailable because the account response could not be verified.",
+      res.status
+    );
+  }
+  return menu;
 }
 function attachCleanChromeHeaders(ses) {
   const targetUa = getAuthWindowUserAgent(ses);
@@ -40546,11 +41301,11 @@ function attachDiagnosticListeners(webContents, label = "main") {
     console.error(`[YTM Auth ${label} unresponsive] render process became unresponsive`);
   });
 }
-async function readCookiesFromPartition(ses) {
+async function readCookiesFromPartitionStrict(ses) {
   const [googleCookies, allCookies, ytCookies] = await Promise.all([
-    ses.cookies.get({ url: "https://accounts.google.com" }).catch(() => []),
-    ses.cookies.get({}).catch(() => []),
-    ses.cookies.get({ url: "https://music.youtube.com" }).catch(() => [])
+    ses.cookies.get({ url: "https://accounts.google.com" }),
+    ses.cookies.get({}),
+    ses.cookies.get({ url: "https://music.youtube.com" })
   ]);
   const seen = /* @__PURE__ */ new Map();
   for (const c of [...googleCookies, ...allCookies, ...ytCookies]) {
@@ -40558,192 +41313,432 @@ async function readCookiesFromPartition(ses) {
   }
   return Array.from(seen.entries()).map(([k, v]) => `${k}=${v}`).join("; ");
 }
+async function getPartitionAccountState(ses, account) {
+  if (!account) return "unknown";
+  try {
+    const cookie = await readCookiesFromPartitionStrict(ses);
+    if (!hasYouTubeLoginCookie(cookie)) {
+      return hasResidualYouTubeAuthCookie(cookie) ? "unknown" : "empty";
+    }
+    const menu = await fetchAccountMenuWithCookies(
+      cookie,
+      account.visitorData,
+      account.dataSyncId,
+      account.accountIndex,
+      false
+    );
+    if (!menu.accountName && !menu.email && !menu.handle) return "unknown";
+    return matchAccountIdentity(account, menu);
+  } catch {
+    return "unknown";
+  }
+}
+var AUTH_MUTATION_LOCK_KEY = /* @__PURE__ */ Symbol.for("riri-player.ytm.auth-mutation-lock.v1");
+function getAuthMutationState() {
+  const registry = globalThis;
+  const existing = registry[AUTH_MUTATION_LOCK_KEY];
+  if (existing && typeof existing === "object" && "queue" in existing) {
+    return existing;
+  }
+  const created = { queue: Promise.resolve() };
+  registry[AUTH_MUTATION_LOCK_KEY] = created;
+  return created;
+}
+var authMutationState = getAuthMutationState();
+function withAuthMutationLock(operation) {
+  const result = authMutationState.queue.then(operation, operation);
+  authMutationState.queue = result.then(
+    () => void 0,
+    () => void 0
+  );
+  return result;
+}
 function configureElectronYtmCookieRefresh(getSession) {
-  registerCookieRefreshCallback(async () => {
+  const refresh = async (expectedAccountId) => {
     try {
-      const active = await getActiveYtAccount();
-      if (!active) return false;
-      const ses = getSession();
-      const freshCookie = await readCookiesFromPartition(ses);
-      if (!hasYouTubeLoginCookie(freshCookie)) return false;
-      await updateActiveYtAccountAuth({ cookie: freshCookie, lastValidatedAt: Date.now() });
-      resetInnertubeClientCache();
-      return true;
-    } catch {
+      return await withAuthMutationLock(async () => {
+        const active = await getActiveYtAccount();
+        if (!active) return false;
+        if (expectedAccountId && active.id !== expectedAccountId) return false;
+        const ses = getSession(active);
+        const freshCookie = await readCookiesFromPartitionStrict(ses);
+        if (!hasYouTubeLoginCookie(freshCookie)) return false;
+        try {
+          const menu = await fetchAccountMenuWithCookies(
+            freshCookie,
+            active.visitorData,
+            active.dataSyncId,
+            active.accountIndex,
+            true
+          );
+          if (!accountMenuMatchesStoredAccount(active, menu)) {
+            return false;
+          }
+        } catch {
+          return false;
+        }
+        const updated = await updateActiveYtAccountAuth(
+          { cookie: freshCookie, lastValidatedAt: Date.now() },
+          active.id
+        );
+        if (!updated) return false;
+        resetInnertubeClientCache();
+        return true;
+      });
+    } catch (err2) {
+      if (err2 instanceof YtVaultUnreadableError) throw err2;
       return false;
     }
-  });
+  };
+  registerCookieRefreshCallback(refresh);
+  return refresh;
 }
 var currentAuthWin = null;
-function closeCurrentAuthWin() {
+var authAttemptGeneration = 0;
+var activeAuthAttempt = null;
+var authResetInProgress = false;
+function beginAuthAttempt() {
+  let resolveCompletion;
+  const completion = new Promise((resolve) => {
+    resolveCompletion = resolve;
+  });
+  const attempt = {
+    generation: ++authAttemptGeneration,
+    cancelled: false,
+    window: null,
+    abort: null,
+    completion,
+    resolveCompletion
+  };
+  activeAuthAttempt = attempt;
+  return attempt;
+}
+function isAuthAttemptCurrent(attempt) {
+  return !attempt.cancelled && attempt.generation === authAttemptGeneration && activeAuthAttempt === attempt;
+}
+function invalidateAuthAttempt(attempt) {
+  attempt.cancelled = true;
+  if (attempt.generation === authAttemptGeneration) {
+    authAttemptGeneration += 1;
+  }
+}
+function finishAuthAttempt(attempt) {
+  if (activeAuthAttempt === attempt) {
+    activeAuthAttempt = null;
+  }
+  attempt.abort = null;
+  attempt.resolveCompletion();
+}
+function closeAuthWindow(win) {
   try {
-    if (currentAuthWin && !currentAuthWin.isDestroyed()) {
-      currentAuthWin.close();
+    if (win && !win.isDestroyed()) {
+      win.close();
     }
   } catch {
   }
+}
+function cancelAuthAttempt(attempt) {
+  invalidateAuthAttempt(attempt);
+  closeAuthWindow(attempt.window || currentAuthWin);
+  attempt.abort?.();
+}
+function closeCurrentAuthWin() {
+  const attempt = activeAuthAttempt;
+  if (attempt) {
+    cancelAuthAttempt(attempt);
+    return;
+  }
+  closeAuthWindow(currentAuthWin);
   currentAuthWin = null;
 }
+async function cancelAndAwaitActiveAuthAttempt() {
+  const attempt = activeAuthAttempt;
+  if (!attempt) return;
+  cancelAuthAttempt(attempt);
+  await attempt.completion;
+}
 async function loginYouTubeMusicWindow(opts) {
-  const { BrowserWindow, session, parentWindow, cleanPartition = true } = opts;
-  const possiblePreloadPaths = [
-    import_node_path2.default.join(__dirname, "ytm", "ytm-login-preload.cjs"),
-    import_node_path2.default.join(__dirname, "ytm-login-preload.cjs"),
-    import_node_path2.default.join(process.cwd(), "electron", "ytm", "ytm-login-preload.cjs")
-  ];
-  let LOGIN_PRELOAD_PATH = possiblePreloadPaths[0];
-  for (const p of possiblePreloadPaths) {
-    if (import_node_fs2.default.existsSync(p)) {
-      LOGIN_PRELOAD_PATH = p;
-      break;
-    }
+  const { BrowserWindow, session, parentWindow, cleanPartition = false } = opts;
+  if (authResetInProgress) {
+    return {
+      ok: false,
+      retryable: true,
+      error: "A YouTube Music factory reset is still in progress. Please retry after it finishes."
+    };
   }
-  const ses = session.fromPartition(YTM_PARTITION);
-  const ua = getAuthWindowUserAgent(ses);
-  if (cleanPartition) {
-    await ses.clearStorageData({
-      storages: ["cookies", "localstorage", "sessionstorage", "indexdb", "serviceworkers", "cachestorage"]
-    }).catch(() => void 0);
-    await ses.clearCache().catch(() => void 0);
+  await cancelAndAwaitActiveAuthAttempt();
+  if (authResetInProgress) {
+    return {
+      ok: false,
+      retryable: true,
+      error: "A YouTube Music factory reset is still in progress. Please retry after it finishes."
+    };
   }
-  attachCleanChromeHeaders(ses);
-  return await new Promise((resolve) => {
-    let finished = false;
-    let capturing = false;
-    let authWin;
-    let loadWatchdog = null;
-    const clearLoadWatchdog = () => {
-      if (loadWatchdog) {
-        clearTimeout(loadWatchdog);
-        loadWatchdog = null;
+  const attempt = beginAuthAttempt();
+  const canPublish = () => isAuthAttemptCurrent(attempt);
+  try {
+    const possiblePreloadPaths = [
+      import_node_path2.default.join(__dirname, "ytm", "ytm-login-preload.cjs"),
+      import_node_path2.default.join(__dirname, "ytm-login-preload.cjs"),
+      import_node_path2.default.join(process.cwd(), "electron", "ytm", "ytm-login-preload.cjs")
+    ];
+    let LOGIN_PRELOAD_PATH = possiblePreloadPaths[0];
+    for (const p of possiblePreloadPaths) {
+      if (import_node_fs2.default.existsSync(p)) {
+        LOGIN_PRELOAD_PATH = p;
+        break;
       }
-    };
-    const done = (result) => {
-      if (finished) return;
-      finished = true;
-      clearLoadWatchdog();
-      currentAuthWin = null;
-      resolve(result);
-    };
-    const failWithError = (error2, cancelled = false) => {
-      clearLoadWatchdog();
-      done({ ok: false, cancelled, error: error2 });
-    };
-    const startInitialLoadWatchdog = () => {
-      clearLoadWatchdog();
-      loadWatchdog = setTimeout(() => {
+    }
+    try {
+      await preflightYtVaultWrite();
+    } catch (err2) {
+      const unreadable = err2 instanceof YtVaultUnreadableError;
+      const resetPending = err2 instanceof YtResetPendingError;
+      return {
+        ok: false,
+        retryable: !unreadable,
+        error: resetPending ? err2.message : unreadable ? err2.message : `Could not verify the encrypted YouTube Music session store before sign-in: ${err2 instanceof Error ? err2.message : "vault write failed."} Please retry.`
+      };
+    }
+    if (!canPublish()) {
+      return {
+        ok: false,
+        cancelled: true,
+        error: "Sign-in was cancelled before the browser session started."
+      };
+    }
+    let activeBefore = null;
+    try {
+      activeBefore = await getActiveYtAccount();
+    } catch (err2) {
+      return {
+        ok: false,
+        retryable: !(err2 instanceof YtVaultUnreadableError),
+        error: err2 instanceof Error ? err2.message : "Could not read the active YouTube Music account."
+      };
+    }
+    if (!canPublish()) {
+      return {
+        ok: false,
+        cancelled: true,
+        error: "Sign-in was cancelled before the account session started."
+      };
+    }
+    let partitionName = getYtAccountPartition(activeBefore);
+    let pendingPartition = false;
+    if (cleanPartition && activeBefore) {
+      partitionName = createPendingYtPartition();
+      pendingPartition = true;
+    } else if (cleanPartition) {
+      partitionName = YTM_PARTITION;
+    }
+    const ses = session.fromPartition(partitionName);
+    const ua = getAuthWindowUserAgent(ses);
+    if (cleanPartition && !pendingPartition) {
+      try {
+        await ses.clearStorageData({
+          storages: ["cookies", "localstorage", "sessionstorage", "indexdb", "serviceworkers", "cachestorage"]
+        });
+        if (ses.clearCache) {
+          await ses.clearCache().catch(() => void 0);
+        }
+        const remainingCookie = await readCookiesFromPartitionStrict(ses);
+        if (hasResidualYouTubeAuthCookie(remainingCookie)) {
+          throw new Error("sensitive authentication cookies are still present");
+        }
+      } catch (err2) {
+        return {
+          ok: false,
+          retryable: true,
+          error: `Could not reset the YouTube Music sign-in session: ${err2 instanceof Error ? err2.message : "storage clearing failed."} Please retry.`
+        };
+      }
+      if (!canPublish()) {
+        return {
+          ok: false,
+          cancelled: true,
+          error: "Sign-in was cancelled while the browser session was being reset."
+        };
+      }
+    }
+    attachCleanChromeHeaders(ses);
+    if (!canPublish()) {
+      return {
+        ok: false,
+        cancelled: true,
+        error: "Sign-in was cancelled before the sign-in window opened."
+      };
+    }
+    return await new Promise((resolve) => {
+      let finished = false;
+      let capturing = false;
+      let publishedAccount = false;
+      let authWin;
+      let loadWatchdog = null;
+      const clearLoadWatchdog = () => {
+        if (loadWatchdog) {
+          clearTimeout(loadWatchdog);
+          loadWatchdog = null;
+        }
+      };
+      const done = async (result) => {
+        if (finished) return;
+        finished = true;
         clearLoadWatchdog();
-        if (!authWin.isDestroyed()) {
+        if (currentAuthWin === authWin) currentAuthWin = null;
+        if (attempt.window === authWin) attempt.window = null;
+        attempt.abort = null;
+        if (!result.ok && pendingPartition && !publishedAccount) {
           try {
-            authWin.close();
-          } catch {
+            await clearPartitionStorage(session, partitionName);
+          } catch (err2) {
+            try {
+              await markYtPartitionInvalidated(null, partitionName);
+            } catch {
+            }
+            result = {
+              ...result,
+              warning: `The incomplete sign-in session could not be fully cleared: ${err2 instanceof Error ? err2.message : "partition cleanup failed."}`
+            };
           }
         }
-        failWithError("Couldn't reach Google - Retry", false);
-      }, 3e4);
-    };
-    authWin = new BrowserWindow({
-      width: 520,
-      height: 700,
-      parent: parentWindow || void 0,
-      modal: Boolean(parentWindow),
-      show: false,
-      title: "Sign in - YouTube Music",
-      backgroundColor: "#ffffff",
-      autoHideMenuBar: true,
-      webPreferences: {
-        preload: YTM_AUTH_UA_MODE === "firefox" && import_node_fs2.default.existsSync(LOGIN_PRELOAD_PATH) ? LOGIN_PRELOAD_PATH : void 0,
-        contextIsolation: true,
-        nodeIntegration: false,
-        sandbox: true,
-        partition: YTM_PARTITION
-      }
-    });
-    currentAuthWin = authWin;
-    if (YTM_AUTH_UA_MODE === "firefox") {
-      try {
-        authWin.webContents.setUserAgent(ua);
-      } catch {
-      }
-    }
-    attachDiagnosticListeners(authWin.webContents, "main");
-    authWin.webContents.on("render-process-gone", (_e, detail) => {
-      const d = detail;
-      console.error(
-        `[YTM Auth render-process-gone] exitCode=${d?.exitCode ?? "unknown"} reason="${d?.reason ?? "unknown"}" crashType="${d?.crashType ?? "unknown"}"`
-      );
-      if (!finished) {
-        failWithError("Couldn't reach Google - Retry", false);
-      }
-    });
-    authWin.webContents.on("unresponsive", () => {
-      console.error("[YTM Auth unresponsive] render process became unresponsive");
-      if (!finished) {
-        failWithError("Couldn't reach Google - Retry", false);
-      }
-    });
-    authWin.webContents.once("ready-to-show", () => {
-      if (!authWin.isDestroyed()) {
-        authWin.show();
-      }
-    });
-    if (typeof authWin.webContents.setWindowOpenHandler === "function") {
-      authWin.webContents.setWindowOpenHandler((details) => {
-        if (isAllowedAuthPopupUrl(details.url)) {
-          return {
-            action: "allow",
-            overrideBrowserWindowOptions: {
-              width: 500,
-              height: 660,
-              parent: authWin,
-              modal: false,
-              autoHideMenuBar: true,
-              webPreferences: {
-                contextIsolation: true,
-                nodeIntegration: false,
-                sandbox: true,
-                partition: YTM_PARTITION,
-                preload: YTM_AUTH_UA_MODE === "firefox" && import_node_fs2.default.existsSync(LOGIN_PRELOAD_PATH) ? LOGIN_PRELOAD_PATH : void 0
-              }
+        resolve(result);
+      };
+      attempt.abort = () => {
+        void done({
+          ok: false,
+          cancelled: true,
+          error: "Sign-in was cancelled before completing authentication."
+        });
+      };
+      const failWithError = (error2, cancelled = false, retryable = false) => {
+        clearLoadWatchdog();
+        done({ ok: false, cancelled, error: error2, retryable });
+      };
+      const startInitialLoadWatchdog = () => {
+        clearLoadWatchdog();
+        loadWatchdog = setTimeout(() => {
+          clearLoadWatchdog();
+          if (!authWin.isDestroyed()) {
+            try {
+              authWin.close();
+            } catch {
             }
-          };
+          }
+          failWithError("Couldn't reach Google - Retry", false, true);
+        }, 3e4);
+      };
+      authWin = new BrowserWindow({
+        width: 520,
+        height: 700,
+        parent: parentWindow || void 0,
+        modal: Boolean(parentWindow),
+        show: false,
+        title: "Sign in - YouTube Music",
+        backgroundColor: "#ffffff",
+        autoHideMenuBar: true,
+        webPreferences: {
+          preload: YTM_AUTH_UA_MODE === "firefox" && import_node_fs2.default.existsSync(LOGIN_PRELOAD_PATH) ? LOGIN_PRELOAD_PATH : void 0,
+          contextIsolation: true,
+          nodeIntegration: false,
+          sandbox: true,
+          partition: partitionName
         }
-        return { action: "deny" };
       });
-    }
-    authWin.webContents.on("did-create-window", (childWin) => {
-      if (!childWin?.webContents) return;
+      currentAuthWin = authWin;
+      attempt.window = authWin;
       if (YTM_AUTH_UA_MODE === "firefox") {
         try {
-          childWin.webContents.setUserAgent(ua);
+          authWin.webContents.setUserAgent(ua);
         } catch {
         }
       }
-      attachDiagnosticListeners(childWin.webContents, "popup");
-      childWin.webContents.on("did-finish-load", () => {
-        injectMainWorldShim(childWin.webContents);
-        void inspectGooglePageVisibleError(childWin.webContents);
-        void checkLogin();
+      attachDiagnosticListeners(authWin.webContents, "main");
+      authWin.webContents.on("render-process-gone", (_e, detail) => {
+        const d = detail;
+        console.error(
+          `[YTM Auth render-process-gone] exitCode=${d?.exitCode ?? "unknown"} reason="${d?.reason ?? "unknown"}" crashType="${d?.crashType ?? "unknown"}"`
+        );
+        if (!finished) {
+          failWithError("Couldn't reach Google - Retry", false, true);
+        }
       });
-      childWin.webContents.on("did-navigate", () => {
-        injectMainWorldShim(childWin.webContents);
-        void checkLogin();
+      authWin.webContents.on("unresponsive", () => {
+        console.error("[YTM Auth unresponsive] render process became unresponsive");
+        if (!finished) {
+          failWithError("Couldn't reach Google - Retry", false, true);
+        }
       });
-    });
-    const checkLogin = async () => {
-      if (capturing || finished) return;
-      try {
-        if (authWin.isDestroyed()) return;
-        const currentUrl = authWin.webContents.getURL();
-        if (!currentUrl.startsWith("https://music.youtube.com")) return;
-        const cookieStr = await readCookiesFromPartition(ses);
-        if (!hasYouTubeLoginCookie(cookieStr)) return;
-        capturing = true;
-        let meta = { loggedIn: false, visitorData: "", dataSyncId: "" };
-        for (let attempt = 0; attempt < 10; attempt++) {
-          if (authWin.isDestroyed() || finished) return;
+      authWin.webContents.once("ready-to-show", () => {
+        if (!authWin.isDestroyed()) {
+          authWin.show();
+        }
+      });
+      if (typeof authWin.webContents.setWindowOpenHandler === "function") {
+        authWin.webContents.setWindowOpenHandler((details) => {
+          if (isAllowedAuthPopupUrl(details.url)) {
+            return {
+              action: "allow",
+              overrideBrowserWindowOptions: {
+                width: 500,
+                height: 660,
+                parent: authWin,
+                modal: false,
+                autoHideMenuBar: true,
+                webPreferences: {
+                  contextIsolation: true,
+                  nodeIntegration: false,
+                  sandbox: true,
+                  partition: partitionName,
+                  preload: YTM_AUTH_UA_MODE === "firefox" && import_node_fs2.default.existsSync(LOGIN_PRELOAD_PATH) ? LOGIN_PRELOAD_PATH : void 0
+                }
+              }
+            };
+          }
+          return { action: "deny" };
+        });
+      }
+      authWin.webContents.on("did-create-window", (childWin) => {
+        if (!childWin?.webContents) return;
+        if (YTM_AUTH_UA_MODE === "firefox") {
           try {
-            meta = await authWin.webContents.executeJavaScript(`
+            childWin.webContents.setUserAgent(ua);
+          } catch {
+          }
+        }
+        attachDiagnosticListeners(childWin.webContents, "popup");
+        childWin.webContents.on("did-finish-load", () => {
+          injectMainWorldShim(childWin.webContents);
+          void inspectGooglePageVisibleError(childWin.webContents);
+          void checkLogin();
+        });
+        childWin.webContents.on("did-navigate", () => {
+          injectMainWorldShim(childWin.webContents);
+          void checkLogin();
+        });
+      });
+      const checkLogin = async () => {
+        if (capturing || finished || !canPublish()) return;
+        try {
+          if (authWin.isDestroyed()) return;
+          const currentUrl = authWin.webContents.getURL();
+          if (!currentUrl.startsWith("https://music.youtube.com")) return;
+          let cookieStr;
+          try {
+            cookieStr = await readCookiesFromPartitionStrict(ses);
+          } catch (err2) {
+            throw new YtmAuthVerificationError(
+              `Could not read the YouTube Music sign-in cookies: ${err2 instanceof Error ? err2.message : "cookie storage is unavailable."}`
+            );
+          }
+          if (!hasYouTubeLoginCookie(cookieStr)) return;
+          if (!canPublish()) return;
+          capturing = true;
+          let meta = { loggedIn: false, visitorData: "", dataSyncId: "" };
+          for (let pollAttempt = 0; pollAttempt < 10; pollAttempt++) {
+            if (authWin.isDestroyed() || finished) return;
+            try {
+              meta = await authWin.webContents.executeJavaScript(`
               (() => {
                 try {
                   const c = window.ytcfg;
@@ -40776,92 +41771,159 @@ async function loginYouTubeMusicWindow(opts) {
                 }
               })()
             `);
-            if (meta.loggedIn && meta.visitorData && (meta.dataSyncId || attempt >= 5)) break;
-          } catch {
+              if (meta.loggedIn && meta.visitorData && (meta.dataSyncId || pollAttempt >= 5)) break;
+            } catch {
+            }
+            await new Promise((r) => setTimeout(r, 450));
           }
-          await new Promise((r) => setTimeout(r, 450));
-        }
-        const menu = await fetchAccountMenuWithCookies(
-          cookieStr,
-          meta.visitorData,
-          meta.dataSyncId,
-          0
-        );
-        const isVerified = meta.loggedIn || Boolean(menu.accountName || menu.email);
-        if (!isVerified) {
-          capturing = false;
-          return;
-        }
-        const accountId = menu.email || import_node_crypto3.default.createHash("sha1").update(cookieStr.slice(0, 64)).digest("hex").slice(0, 12);
-        const status = await upsertYtAccount({
-          id: `ytm-${accountId}`,
-          name: menu.accountName || menu.email || "YouTube Music Listener",
-          handle: menu.handle || menu.email || "",
-          email: menu.email || "",
-          avatarUrl: menu.avatarUrl || "",
-          accountIndex: 0,
-          cookie: cookieStr,
-          visitorData: meta.visitorData || "",
-          dataSyncId: meta.dataSyncId || "",
-          addedAt: Date.now(),
-          lastValidatedAt: Date.now()
-        });
-        resetInnertubeClientCache();
-        if (!authWin.isDestroyed()) {
-          authWin.close();
-        }
-        done({ ok: true, status });
-      } catch {
-        capturing = false;
-      }
-    };
-    authWin.webContents.on("did-finish-load", () => {
-      clearLoadWatchdog();
-      injectMainWorldShim(authWin.webContents);
-      void inspectGooglePageVisibleError(authWin.webContents);
-      void checkLogin();
-    });
-    authWin.webContents.on("did-navigate", () => {
-      injectMainWorldShim(authWin.webContents);
-      void checkLogin();
-    });
-    authWin.webContents.once("did-start-load", () => {
-      startInitialLoadWatchdog();
-    });
-    authWin.webContents.on("did-navigate-in-page", () => {
-      injectMainWorldShim(authWin.webContents);
-      void inspectGooglePageVisibleError(authWin.webContents);
-      void checkLogin();
-    });
-    authWin.webContents.on(
-      "did-fail-load",
-      (_e, errorCode, errorDescription, validatedUrl, isMainFrame) => {
-        if (isMainFrame && validatedUrl?.includes("accounts.google.com") && errorCode !== -3) {
-          clearLoadWatchdog();
-          done({
-            ok: false,
-            blocked: true,
-            error: `Google sign-in could not load (${errorDescription}). Click Try again to reopen with a clean session.`
+          if (!canPublish()) return;
+          const freshCookieStr = await readCookiesFromPartitionStrict(ses);
+          if (!hasYouTubeLoginCookie(freshCookieStr)) {
+            throw new YtmAuthVerificationError(
+              "The YouTube Music sign-in session changed before it could be verified."
+            );
+          }
+          if (!canPublish()) return;
+          const menu = await fetchAccountMenuWithCookies(
+            freshCookieStr,
+            meta.visitorData,
+            meta.dataSyncId,
+            0,
+            true
+          );
+          if (!canPublish()) return;
+          const accountId = menu.email || import_node_crypto3.default.createHash("sha1").update(freshCookieStr.slice(0, 64)).digest("hex").slice(0, 12);
+          const nextAccountId = `ytm-${accountId}`;
+          const existingAccount = (await getAllYtAccounts()).find(
+            (candidate) => candidate.id === nextAccountId || Boolean(
+              menu.email && candidate.email && candidate.email.toLowerCase() === menu.email.toLowerCase()
+            )
+          );
+          const previousPartition = existingAccount ? getYtAccountPartition(existingAccount) : null;
+          const status = await withAuthMutationLock(async () => {
+            if (!canPublish()) {
+              throw new YtAuthOperationCancelledError();
+            }
+            return await upsertYtAccount(
+              {
+                id: nextAccountId,
+                name: menu.accountName || menu.email || "YouTube Music Listener",
+                handle: menu.handle || menu.email || "",
+                email: menu.email || "",
+                avatarUrl: menu.avatarUrl || "",
+                accountIndex: 0,
+                cookie: freshCookieStr,
+                visitorData: meta.visitorData || "",
+                dataSyncId: meta.dataSyncId || "",
+                partitionName,
+                addedAt: Date.now(),
+                lastValidatedAt: Date.now()
+              },
+              {
+                canPublish,
+                onCommitted: () => {
+                  publishedAccount = true;
+                }
+              }
+            );
           });
+          publishedAccount = true;
+          let warning;
+          if (existingAccount && previousPartition && previousPartition !== partitionName) {
+            try {
+              await invalidatePersistentPartition(
+                session,
+                existingAccount.id,
+                previousPartition
+              );
+            } catch (err2) {
+              warning = `The account was saved in a new browser partition, but the previous browser session could not be fully cleared: ${err2 instanceof Error ? err2.message : "partition cleanup failed."}`;
+              console.warn("[YTM Auth]", warning);
+            }
+          }
+          resetInnertubeClientCache();
+          done({ ok: true, status, ...warning ? { warning } : {} });
+          if (!authWin.isDestroyed()) {
+            authWin.close();
+          }
+        } catch (err2) {
+          capturing = false;
+          if (finished) return;
+          let message;
+          let retryable = true;
+          let cancelled = false;
+          if (err2 instanceof YtAuthOperationCancelledError) {
+            message = err2.message;
+            cancelled = true;
+            retryable = false;
+          } else if (err2 instanceof YtmAuthRejectedError) {
+            message = `Google rejected the YouTube Music sign-in session (${err2.status}). Please sign in again.`;
+            retryable = false;
+          } else if (err2 instanceof YtmAuthVerificationError) {
+            message = `${err2.message} Please retry.`;
+          } else if (err2 instanceof YtVaultUnreadableError) {
+            message = err2.message;
+            retryable = false;
+          } else {
+            message = `Could not verify the YouTube Music sign-in${err2 instanceof Error ? `: ${err2.message}` : "."} Please retry.`;
+          }
+          failWithError(message, cancelled, retryable);
+          if (!authWin.isDestroyed()) {
+            authWin.close();
+          }
         }
-      }
-    );
-    authWin.on("closed", () => {
-      done({
-        ok: false,
-        cancelled: true,
-        error: "Sign-in window closed before completing authentication."
+      };
+      authWin.webContents.on("did-finish-load", () => {
+        clearLoadWatchdog();
+        injectMainWorldShim(authWin.webContents);
+        void inspectGooglePageVisibleError(authWin.webContents);
+        void checkLogin();
       });
-    });
-    if (!authWin.isDestroyed()) {
-      void authWin.loadURL(
-        YTM_LOGIN_URL,
-        YTM_AUTH_UA_MODE === "firefox" ? { userAgent: ua } : void 0
+      authWin.webContents.on("did-navigate", () => {
+        injectMainWorldShim(authWin.webContents);
+        void checkLogin();
+      });
+      authWin.webContents.once("did-start-load", () => {
+        startInitialLoadWatchdog();
+      });
+      authWin.webContents.on("did-navigate-in-page", () => {
+        injectMainWorldShim(authWin.webContents);
+        void inspectGooglePageVisibleError(authWin.webContents);
+        void checkLogin();
+      });
+      authWin.webContents.on(
+        "did-fail-load",
+        (_e, errorCode, errorDescription, validatedUrl, isMainFrame) => {
+          if (isMainFrame && validatedUrl?.includes("accounts.google.com") && errorCode !== -3) {
+            clearLoadWatchdog();
+            done({
+              ok: false,
+              blocked: true,
+              retryable: true,
+              error: `Google sign-in could not load (${errorDescription}). Click Try again to reopen with a clean session.`
+            });
+          }
+        }
       );
-    }
-  });
+      authWin.on("closed", () => {
+        done({
+          ok: false,
+          cancelled: true,
+          error: "Sign-in window closed before completing authentication."
+        });
+      });
+      if (!authWin.isDestroyed()) {
+        void authWin.loadURL(
+          YTM_LOGIN_URL,
+          YTM_AUTH_UA_MODE === "firefox" ? { userAgent: ua } : void 0
+        );
+      }
+    });
+  } finally {
+    finishAuthAttempt(attempt);
+  }
 }
-async function importYtmSessionFallback(opts) {
+async function importYtmSessionFallbackInternal(opts) {
   const cookieStr = (opts.cookieHeader || "").trim();
   if (!hasYouTubeLoginCookie(cookieStr)) {
     return {
@@ -40891,9 +41953,29 @@ async function importYtmSessionFallback(opts) {
     } catch {
     }
   }
-  const menu = await fetchAccountMenuWithCookies(cookieStr, visitorData, dataSyncId, accountIndex);
+  let menu;
+  try {
+    menu = await fetchAccountMenuWithCookies(
+      cookieStr,
+      visitorData,
+      dataSyncId,
+      accountIndex,
+      true
+    );
+  } catch (err2) {
+    return {
+      ok: false,
+      error: err2 instanceof Error ? err2.message : "YouTube Music rejected the session."
+    };
+  }
+  if (!menu.accountName && !menu.email) {
+    return {
+      ok: false,
+      error: "YouTube Music did not recognize the imported session. Please sign in again."
+    };
+  }
   const accountId = menu.email || import_node_crypto3.default.createHash("sha1").update(cookieStr.slice(0, 64)).digest("hex").slice(0, 12);
-  const status = await upsertYtAccount({
+  const account = {
     id: `ytm-${accountId}`,
     name: menu.accountName || menu.email || "YouTube Music Listener",
     handle: menu.handle || menu.email || "",
@@ -40903,31 +41985,273 @@ async function importYtmSessionFallback(opts) {
     cookie: cookieStr,
     visitorData,
     dataSyncId,
+    ...opts.partitionName?.trim() ? { partitionName: opts.partitionName.trim() } : {},
     addedAt: Date.now(),
     lastValidatedAt: Date.now()
-  });
+  };
+  const upsertOptions = {
+    ...Object.prototype.hasOwnProperty.call(opts, "expectedActiveAccountId") ? { expectedActiveAccountId: opts.expectedActiveAccountId } : {},
+    ...Object.prototype.hasOwnProperty.call(opts, "expectedActiveAccountCookie") ? { expectedActiveAccountCookie: opts.expectedActiveAccountCookie } : {},
+    ...opts.source ? { source: opts.source } : {}
+  };
+  let status;
+  try {
+    status = await withAuthMutationLock(async () => {
+      return await upsertYtAccount(account, upsertOptions);
+    });
+  } catch (err2) {
+    if (err2 instanceof YtSessionInvalidatedError) {
+      return { ok: false, error: err2.message };
+    }
+    throw err2;
+  }
   resetInnertubeClientCache();
   return { ok: true, status };
+}
+async function importYtmSessionFallback(opts) {
+  return await importYtmSessionFallbackInternal({
+    cookieHeader: opts.cookieHeader,
+    visitorData: opts.visitorData,
+    dataSyncId: opts.dataSyncId,
+    accountIndex: opts.accountIndex,
+    expectedActiveAccountId: opts.expectedActiveAccountId,
+    expectedActiveAccountCookie: opts.expectedActiveAccountCookie
+    // partitionName and source are intentionally omitted — they are internal only
+  });
 }
 async function switchYtmAccount(accountId) {
   const status = await switchActiveYtAccount(accountId);
   resetInnertubeClientCache();
   return status;
 }
-async function logoutYtmAccount(opts) {
-  const nextStatus = await removeYtAccountById(opts?.accountId);
-  resetInnertubeClientCache();
-  if (!nextStatus.loggedIn && opts?.session) {
-    try {
-      const ses = opts.session.fromPartition(YTM_PARTITION);
-      await ses.clearStorageData({ storages: ["cookies", "localstorage"] });
-    } catch {
-    }
+async function clearPartitionStorage(session, partitionName) {
+  const ses = session.fromPartition(partitionName);
+  await ses.clearStorageData({
+    storages: [
+      "cookies",
+      "localstorage",
+      "sessionstorage",
+      "indexdb",
+      "serviceworkers",
+      "cachestorage"
+    ]
+  });
+  if (ses.clearCache) {
+    await ses.clearCache().catch(() => void 0);
   }
-  return nextStatus;
+  const remainingCookie = await readCookiesFromPartitionStrict(ses);
+  if (hasResidualYouTubeAuthCookie(remainingCookie)) {
+    throw new Error("sensitive authentication cookies are still present");
+  }
 }
-async function getYtmAuthStatus() {
-  return await getPublicYtAuthStatus();
+async function invalidatePersistentPartition(session, accountId, partitionName = YTM_PARTITION) {
+  try {
+    await markYtPartitionInvalidated(accountId || null, partitionName);
+  } catch (err2) {
+    throw new YtmLogoutError(
+      `Could not sign out of YouTube Music because the encrypted logout state could not be saved: ${err2 instanceof Error ? err2.message : "vault update failed."} Please retry.`
+    );
+  }
+  try {
+    await clearPartitionStorage(session, partitionName);
+  } catch (err2) {
+    throw new YtmLogoutError(
+      `Could not sign out of YouTube Music because the persistent browser session could not be cleared: ${err2 instanceof Error ? err2.message : "storage clearing failed."} Please retry.`
+    );
+  }
+}
+async function logoutYtmAccount(opts) {
+  return await withAuthMutationLock(async () => {
+    const activeBefore = await getActiveYtAccount();
+    const targetAccount = opts?.accountId ? await getYtAccountById(opts.accountId) : activeBefore;
+    if (!targetAccount) {
+      if (opts?.accountId) {
+        throw new YtAccountNotFoundError(opts.accountId);
+      }
+      if (opts?.session) {
+        await invalidatePersistentPartition(opts.session, null, YTM_PARTITION);
+      }
+      return await getPublicYtAuthStatus();
+    }
+    const targetPartition = getYtAccountPartition(targetAccount);
+    let partitionState = "unknown";
+    if (opts?.session) {
+      try {
+        partitionState = await getPartitionAccountState(
+          opts.session.fromPartition(targetPartition),
+          targetAccount
+        );
+      } catch {
+        partitionState = "unknown";
+      }
+    }
+    if (opts?.session) {
+      if (partitionState === "different") {
+        throw new YtmPartitionOwnershipConflictError(
+          `The browser partition for ${targetAccount.id} is owned by a different YouTube Music account; logout was not applied.`
+        );
+      }
+      await invalidatePersistentPartition(
+        opts.session,
+        targetAccount.id,
+        targetPartition
+      );
+    } else {
+      if (hasYouTubeLoginCookie(targetAccount.cookie)) {
+        try {
+          const menu = await fetchAccountMenuWithCookies(
+            targetAccount.cookie,
+            targetAccount.visitorData,
+            targetAccount.dataSyncId,
+            targetAccount.accountIndex,
+            false
+          );
+          if (matchAccountIdentity(targetAccount, menu) === "different") {
+            throw new YtmPartitionOwnershipConflictError(
+              `The stored credentials for ${targetAccount.id} belong to a different YouTube Music account; logout was not applied.`
+            );
+          }
+        } catch (err2) {
+          if (err2 instanceof YtmPartitionOwnershipConflictError) throw err2;
+        }
+      }
+      await markYtPartitionInvalidated(targetAccount.id, targetPartition);
+    }
+    const nextStatus = await removeYtAccountById(targetAccount.id, targetAccount);
+    resetInnertubeClientCache();
+    return nextStatus;
+  });
+}
+async function clearPendingResetPartitions(session, pending) {
+  for (const partitionName of pending.partitionNames) {
+    await clearPartitionStorage(session, partitionName);
+  }
+}
+async function recoverPendingYtAuthReset(session) {
+  return await withAuthMutationLock(async () => {
+    const pending = await getPendingYtAuthReset();
+    if (!pending) return false;
+    try {
+      await clearPendingResetPartitions(session, pending);
+    } catch (err2) {
+      throw new YtmLogoutError(
+        `Could not finish the pending YouTube Music factory reset because a browser session could not be cleared: ${err2 instanceof Error ? err2.message : "storage clearing failed."} Please retry.`
+      );
+    }
+    await completeYtAuthReset();
+    resetInnertubeClientCache();
+    return true;
+  });
+}
+async function resetYtmAuth(session) {
+  authResetInProgress = true;
+  try {
+    await cancelAndAwaitActiveAuthAttempt();
+    return await withAuthMutationLock(async () => {
+      const pending = await stageYtAuthReset();
+      try {
+        await clearPendingResetPartitions(session, pending);
+      } catch (err2) {
+        throw new YtmLogoutError(
+          `Could not clear every YouTube Music browser session during the factory reset: ${err2 instanceof Error ? err2.message : "storage clearing failed."} Please retry.`
+        );
+      }
+      const status = await completeYtAuthReset();
+      resetInnertubeClientCache();
+      return status;
+    });
+  } finally {
+    authResetInProgress = false;
+  }
+}
+async function preserveUnreadableVaultError(err2) {
+  if (!(err2 instanceof YtVaultUnreadableError)) throw err2;
+  const diagnostic = await getVaultDiagnostic().catch(() => null);
+  throw new YtVaultUnreadableError({
+    ...diagnostic || {},
+    ...err2.diagnostic,
+    error: err2.diagnostic.error || diagnostic?.error,
+    unreadableFile: true
+  });
+}
+async function restoreYtmAccountFromSession(session) {
+  try {
+    await recoverPendingYtAuthReset(session);
+    const active = await getActiveYtAccount();
+    let activeRejected = false;
+    if (active && hasYouTubeLoginCookie(active.cookie)) {
+      try {
+        const menu = await fetchAccountMenuWithCookies(
+          active.cookie,
+          active.visitorData,
+          active.dataSyncId,
+          active.accountIndex,
+          true
+        );
+        const identityMatch = matchAccountIdentity(active, menu);
+        if (identityMatch !== "different") {
+          return await getPublicYtAuthStatus();
+        }
+        activeRejected = true;
+      } catch (err2) {
+        if (!(err2 instanceof YtmAuthRejectedError)) {
+          return await getPublicYtAuthStatus();
+        }
+        activeRejected = true;
+      }
+    } else if (active) {
+      activeRejected = true;
+    }
+    if (!active || activeRejected) {
+      const recoveryPartition = active ? getYtAccountPartition(active) : YTM_PARTITION;
+      const tombstone = await getYtPartitionTombstone(recoveryPartition);
+      if (!tombstone) {
+        let partitionCookie = "";
+        try {
+          const ses = session.fromPartition(recoveryPartition);
+          partitionCookie = await readCookiesFromPartitionStrict(ses);
+        } catch {
+        }
+        if (hasYouTubeLoginCookie(partitionCookie)) {
+          try {
+            const restored = await importYtmSessionFallbackInternal({
+              cookieHeader: partitionCookie,
+              partitionName: recoveryPartition,
+              source: "partition-restore",
+              expectedActiveAccountId: active?.id || null,
+              ...active ? { expectedActiveAccountCookie: active.cookie } : {}
+            });
+            if (restored.ok && restored.status) {
+              resetInnertubeClientCache();
+              console.log(
+                "[YTM Auth] Restored YouTube Music account from the persistent login session."
+              );
+              return restored.status;
+            }
+          } catch (err2) {
+            if (err2 instanceof YtAccountStateConflictError) {
+              return await getPublicYtAuthStatus();
+            }
+            throw err2;
+          }
+        }
+      }
+    }
+    if (active && activeRejected) {
+      try {
+        await removeYtAccountById(active.id, active);
+        resetInnertubeClientCache();
+      } catch (err2) {
+        if (err2 instanceof YtAccountStateConflictError) {
+          return await getPublicYtAuthStatus();
+        }
+        throw err2;
+      }
+    }
+    return await getPublicYtAuthStatus();
+  } catch (err2) {
+    return await preserveUnreadableVaultError(err2);
+  }
 }
 
 // electron/ytm/botguard.ts
@@ -40935,6 +42259,105 @@ var PO_TOKEN_TTL_MS = 4 * 60 * 60 * 1e3;
 var electronProvider = {};
 function configureBotGuardWindowFactory(factory) {
   electronProvider = factory;
+}
+
+// src/utils/ytmContinuation.ts
+var ITEM_CONTINUATION_RENDERER_KEYS = /* @__PURE__ */ new Set([
+  "continuationItemRenderer"
+]);
+var ITEM_SHELF_OWNER_KEYS = /* @__PURE__ */ new Set([
+  "musicShelfRenderer",
+  "musicPlaylistShelfRenderer",
+  "gridRenderer",
+  "musicCarouselShelfRenderer",
+  "musicShelfContinuation",
+  "musicPlaylistShelfContinuation",
+  "gridContinuation"
+]);
+function readContinuation(container) {
+  if (!container || typeof container !== "object") return void 0;
+  const continuation = container.continuation;
+  return typeof continuation === "string" && continuation ? continuation : void 0;
+}
+function readCommandToken(container) {
+  if (!container || typeof container !== "object") return void 0;
+  const obj = container;
+  const command = obj.continuationCommand;
+  if (typeof command?.token === "string" && command.token) return command.token;
+  const endpoint = obj.continuationEndpoint;
+  const endpointCommand = endpoint?.continuationCommand;
+  if (typeof endpointCommand?.token === "string" && endpointCommand.token) {
+    return endpointCommand.token;
+  }
+  return void 0;
+}
+function readContinuationEntry(entry, options = {}) {
+  if (!entry || typeof entry !== "object") return void 0;
+  const obj = entry;
+  return readCommandToken(obj) || readContinuation(obj.nextContinuationData) || readContinuation(obj.continuationData) || (options.allowReload ? readContinuation(obj.reloadContinuationData) : void 0);
+}
+function isExcludedSubtree(key) {
+  return key === "frameworkUpdates" || key === "browseSectionListReloadEndpoint" || key === "chipCloudRenderer";
+}
+function extractYtMusicContinuation(json, options = {}) {
+  if (!json || typeof json !== "object") return void 0;
+  const itemVisited = /* @__PURE__ */ new WeakSet();
+  const findItemContinuation = (node, depth) => {
+    if (!node || typeof node !== "object" || depth > 30) return void 0;
+    if (itemVisited.has(node)) return void 0;
+    itemVisited.add(node);
+    if (Array.isArray(node)) {
+      for (const element of node) {
+        const found = findItemContinuation(element, depth + 1);
+        if (found) return found;
+      }
+      return void 0;
+    }
+    const obj = node;
+    for (const [key, value] of Object.entries(obj)) {
+      if (isExcludedSubtree(key)) continue;
+      if (ITEM_CONTINUATION_RENDERER_KEYS.has(key)) {
+        const token = readContinuationEntry(value);
+        if (token) return token;
+      }
+      const found = findItemContinuation(value, depth + 1);
+      if (found) return found;
+    }
+    return void 0;
+  };
+  const itemContinuation = findItemContinuation(json, 0);
+  if (itemContinuation) return itemContinuation;
+  const listVisited = /* @__PURE__ */ new WeakSet();
+  const findListContinuation = (node, depth, ownerKey) => {
+    if (!node || typeof node !== "object" || depth > 30) return void 0;
+    if (listVisited.has(node)) return void 0;
+    listVisited.add(node);
+    if (Array.isArray(node)) {
+      for (const element of node) {
+        const found = findListContinuation(element, depth + 1, ownerKey);
+        if (found) return found;
+      }
+      return void 0;
+    }
+    const obj = node;
+    for (const [key, value] of Object.entries(obj)) {
+      if (isExcludedSubtree(key)) continue;
+      if (key === "continuations" && Array.isArray(value)) {
+        const isItemShelf = ITEM_SHELF_OWNER_KEYS.has(ownerKey);
+        if (!options.itemShelfOnly || isItemShelf) {
+          const allowReload = isItemShelf;
+          for (const entry of value) {
+            const token = readContinuationEntry(entry, { allowReload });
+            if (token) return token;
+          }
+        }
+      }
+      const found = findListContinuation(value, depth + 1, key);
+      if (found) return found;
+    }
+    return void 0;
+  };
+  return findListContinuation(json, 0, "");
 }
 
 // electron/ytm/homeSearchQueue.ts
@@ -40952,26 +42375,12 @@ function toTrack(t) {
     source: "ytmusic"
   };
 }
-function extractContinuationToken2(json) {
-  if (!json || typeof json !== "object") return void 0;
-  let token;
-  const walk = (node, depth = 0) => {
-    if (token || !node || typeof node !== "object" || depth > 12) return;
-    if (Array.isArray(node)) {
-      for (const item of node) walk(item, depth + 1);
-      return;
-    }
-    const obj = node;
-    if (typeof obj.continuation === "string" && obj.continuation.length > 8) {
-      token = obj.continuation;
-      return;
-    }
-    for (const val of Object.values(obj)) {
-      if (val && typeof val === "object") walk(val, depth + 1);
-    }
-  };
-  walk(json, 0);
-  return token;
+function throwIfAborted(signal) {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  const error2 = new Error("YouTube Music request aborted");
+  error2.name = "AbortError";
+  throw error2;
 }
 function extractWatchTabBrowseIds(json) {
   const result = {};
@@ -40998,14 +42407,18 @@ async function fetchHomeFeed(opts) {
     browseId: "FEmusic_home",
     ...opts.params ? { params: opts.params } : {}
   };
+  const active = await getActiveYtAccount();
+  const requireAuth = Boolean(active && hasYouTubeLoginCookie(active.cookie));
   const json = await innerTubePost({
     endpoint: "browse",
     body,
     gl: opts.gl || "US",
-    hl: opts.hl || "en"
+    hl: opts.hl || "en",
+    requireAuth,
+    accountOverride: active || void 0
   });
   const parsed = parseInnertubeHomeFeed(json);
-  const continuation = extractContinuationToken2(json);
+  const continuation = extractYtMusicContinuation(json);
   return {
     sections: parsed.sections.map((sec) => ({
       id: sec.id,
@@ -41068,48 +42481,110 @@ async function fetchExploreCharts(opts) {
   }
   return { tracks, sections };
 }
+function readRendererText(value) {
+  if (!value || typeof value !== "object") return "";
+  const renderer = value;
+  if (Array.isArray(renderer.runs)) {
+    return renderer.runs.map((run) => run.text || "").join("").trim();
+  }
+  return (renderer.simpleText || "").trim();
+}
+function findCollectionHeader(json) {
+  const root = json && typeof json === "object" ? json : {};
+  const topHeader = root.header || {};
+  const preferred = topHeader.musicDetailHeaderRenderer || topHeader.musicResponsiveHeaderRenderer || topHeader.musicImmersiveHeaderRenderer || topHeader.musicEditablePlaylistDetailHeaderRenderer?.header?.musicResponsiveHeaderRenderer;
+  if (preferred) return preferred;
+  let found;
+  const walk = (node, depth = 0) => {
+    if (found || !node || typeof node !== "object" || depth > 18) return;
+    if (Array.isArray(node)) {
+      for (const element of node) walk(element, depth + 1);
+      return;
+    }
+    const obj = node;
+    const candidate = obj.musicDetailHeaderRenderer || obj.musicResponsiveHeaderRenderer || obj.musicImmersiveHeaderRenderer || obj.musicEditablePlaylistDetailHeaderRenderer?.header?.musicResponsiveHeaderRenderer;
+    if (candidate) {
+      found = candidate;
+      return;
+    }
+    for (const value of Object.values(obj)) {
+      if (value && typeof value === "object") walk(value, depth + 1);
+    }
+  };
+  walk(json, 0);
+  return found;
+}
+function getCollectionHeaderThumbnail(header) {
+  if (!header) return "";
+  const thumbnail = header.thumbnail;
+  const renderer = thumbnail?.croppedSquareThumbnailRenderer || thumbnail?.musicThumbnailRenderer || thumbnail;
+  if (!renderer) return "";
+  const thumbs = renderer.thumbnail?.thumbnails || renderer.thumbnails || [];
+  const rawThumb = pickBestThumbnailUrl(thumbs);
+  return rawThumb ? `/api/proxy-image?url=${encodeURIComponent(rawThumb)}` : "";
+}
+function parseYtmCollectionResponse(json, browseId) {
+  const parsedTracks = parseInnertubeSearchItems(json).map(toTrack);
+  const cards = parseInnertubeBrowseCards(json, "song");
+  const items = cards.map((card) => ({
+    ...card,
+    track: card.track ? toTrack(card.track) : void 0
+  }));
+  const detailHeader = findCollectionHeader(json);
+  const title = detailHeader ? readRendererText(detailHeader.title) : "";
+  const subtitle = detailHeader ? readRendererText(detailHeader.subtitle) || readRendererText(detailHeader.straplineTextOne) : "";
+  let thumbnailUrl = getCollectionHeaderThumbnail(detailHeader);
+  if (!thumbnailUrl) {
+    const matchingCard = items.find(
+      (item) => item.title.trim().toLowerCase() === title.trim().toLowerCase() && item.thumbnailUrl
+    );
+    thumbnailUrl = matchingCard?.thumbnailUrl || items.find((item) => item.thumbnailUrl)?.thumbnailUrl || "";
+  }
+  const isAlbum = browseId.startsWith("MPRE");
+  const tracks = parsedTracks.map((track) => ({
+    ...track,
+    thumbnailUrl: track.thumbnailUrl || thumbnailUrl,
+    // The collection header is authoritative for album metadata. Individual
+    // rows can expose an artist/other column as a misleading album name.
+    album: isAlbum && title ? title : track.album,
+    albumId: isAlbum ? browseId : track.albumId
+  }));
+  const collectionItems = items.map((item) => ({
+    ...item,
+    thumbnailUrl: item.thumbnailUrl || thumbnailUrl,
+    track: item.track ? {
+      ...item.track,
+      thumbnailUrl: item.track.thumbnailUrl || thumbnailUrl,
+      album: isAlbum && title ? title : item.track.album,
+      albumId: isAlbum ? browseId : item.track.albumId
+    } : void 0
+  }));
+  return {
+    browseId,
+    title: title || tracks[0]?.album || "YouTube Music Collection",
+    subtitle: subtitle || `${tracks.length} tracks`,
+    thumbnailUrl: thumbnailUrl || tracks[0]?.thumbnailUrl || "",
+    tracks,
+    items: collectionItems,
+    continuation: extractYtMusicContinuation(json, { itemShelfOnly: true })
+  };
+}
 async function browseYtmCollection(opts) {
   let targetBrowseId = (opts.browseId || "").trim();
   if (targetBrowseId && !opts.continuation && !targetBrowseId.startsWith("VL") && !targetBrowseId.startsWith("UC") && !targetBrowseId.startsWith("MPRE") && !targetBrowseId.startsWith("FE") && !targetBrowseId.startsWith("MP") && /^(PL|OLAK5uy_|RDCLAK5uy_|UU|LL|FL)/.test(targetBrowseId)) {
     targetBrowseId = `VL${targetBrowseId}`;
   }
+  const active = await getActiveYtAccount();
+  const requireAuth = Boolean(active && hasYouTubeLoginCookie(active.cookie));
   const json = await innerTubePost({
     endpoint: "browse",
     body: opts.continuation ? { continuation: opts.continuation } : { browseId: targetBrowseId },
     gl: opts.gl || "US",
-    hl: opts.hl || "en"
+    hl: opts.hl || "en",
+    requireAuth,
+    accountOverride: active || void 0
   });
-  const tracks = parseInnertubeSearchItems(json).map(toTrack);
-  const cards = parseInnertubeBrowseCards(json, "song");
-  const items = cards.map((c) => ({
-    ...c,
-    track: c.track ? toTrack(c.track) : void 0
-  }));
-  let title = "";
-  let subtitle = "";
-  let thumbnailUrl = "";
-  const header = json.header || {};
-  const detailHeader = header.musicDetailHeaderRenderer || header.musicResponsiveHeaderRenderer || header.musicImmersiveHeaderRenderer || header.musicEditablePlaylistDetailHeaderRenderer?.header?.musicResponsiveHeaderRenderer;
-  if (detailHeader) {
-    const titleRuns = detailHeader.title?.runs;
-    title = (titleRuns || []).map((r) => r.text || "").join("").trim();
-    const subRuns = detailHeader.subtitle?.runs;
-    subtitle = (subRuns || []).map((r) => r.text || "").join("").trim();
-    const thumbs = detailHeader.thumbnail?.croppedSquareThumbnailRenderer?.thumbnail?.thumbnails || detailHeader.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
-    const rawThumb = thumbs[thumbs.length - 1]?.url || thumbs[0]?.url || "";
-    if (rawThumb) {
-      thumbnailUrl = `/api/proxy-image?url=${encodeURIComponent(rawThumb)}`;
-    }
-  }
-  return {
-    browseId: targetBrowseId,
-    title: title || tracks[0]?.album || "YouTube Music Collection",
-    subtitle: subtitle || `${tracks.length} tracks`,
-    thumbnailUrl: thumbnailUrl || tracks[0]?.thumbnailUrl || "",
-    tracks,
-    items,
-    continuation: extractContinuationToken2(json)
-  };
+  return parseYtmCollectionResponse(json, targetBrowseId);
 }
 async function searchYtm(opts) {
   const q = (opts.query || "").trim();
@@ -41143,7 +42618,7 @@ async function searchYtm(opts) {
   return {
     tracks,
     cards,
-    continuation: extractContinuationToken2(json)
+    continuation: extractYtMusicContinuation(json)
   };
 }
 async function fetchYtmSearchSuggestions(opts) {
@@ -41169,6 +42644,7 @@ async function fetchYtmSearchSuggestions(opts) {
   }
 }
 async function fetchNextQueue(opts) {
+  throwIfAborted(opts.signal);
   const body = opts.continuation ? { continuation: opts.continuation } : {
     isAudioOnly: true,
     enablePersistentPlaylistPanel: true,
@@ -41183,6 +42659,7 @@ async function fetchNextQueue(opts) {
     gl: opts.gl || "US",
     hl: opts.hl || "en"
   });
+  throwIfAborted(opts.signal);
   const parsed = parseInnertubeNext(json);
   if (!parsed) return null;
   const tabIds = extractWatchTabBrowseIds(json);
@@ -41192,19 +42669,39 @@ async function fetchNextQueue(opts) {
     currentIndex: parsed.currentIndex,
     continuation: parsed.continuation,
     lyricsBrowseId: tabIds.lyricsBrowseId,
+    sourceVideoId: opts.videoId || parsed.endpoint.watchEndpoint.videoId,
     relatedBrowseId: tabIds.relatedBrowseId,
     endpoint: parsed.endpoint,
     automixEndpoint: parsed.automixEndpoint,
     queueChips: parsed.queueChips
   };
 }
+function selectMatchingLyricsBrowseId(videoId, lyricsBrowseId, lyricsBrowseVideoId) {
+  if (!lyricsBrowseId) return void 0;
+  return lyricsBrowseVideoId === videoId ? lyricsBrowseId : void 0;
+}
 async function fetchYtmLyrics(opts) {
+  throwIfAborted(opts.signal);
   const gl = opts.gl || "US";
   const hl = opts.hl || "en";
-  let browseId = opts.lyricsBrowseId;
+  let browseId = selectMatchingLyricsBrowseId(
+    opts.videoId,
+    opts.lyricsBrowseId,
+    opts.lyricsBrowseVideoId
+  );
   if (!browseId && opts.videoId) {
-    const nextRes = await fetchNextQueue({ videoId: opts.videoId, gl, hl }).catch(() => null);
-    browseId = nextRes?.lyricsBrowseId;
+    const nextRes = await fetchNextQueue({
+      videoId: opts.videoId,
+      gl,
+      hl,
+      signal: opts.signal
+    }).catch(() => null);
+    throwIfAborted(opts.signal);
+    browseId = selectMatchingLyricsBrowseId(
+      opts.videoId,
+      nextRes?.lyricsBrowseId,
+      nextRes?.sourceVideoId
+    );
   }
   if (!browseId) return {};
   try {
@@ -41214,6 +42711,7 @@ async function fetchYtmLyrics(opts) {
       gl,
       hl
     });
+    throwIfAborted(opts.signal);
     let text = "";
     const walk = (node, depth = 0) => {
       if (text || !node || typeof node !== "object" || depth > 14) return;
@@ -41233,7 +42731,8 @@ async function fetchYtmLyrics(opts) {
     };
     walk(json, 0);
     return text ? { plainLyrics: text, source: "YouTube Music" } : {};
-  } catch {
+  } catch (error2) {
+    if (opts.signal?.aborted) throw error2;
     return {};
   }
 }
@@ -41260,127 +42759,154 @@ function toBrowseItem(card) {
     track: card.track ? toTrack2(card.track) : void 0
   };
 }
-function extractContinuation(json) {
-  if (!json || typeof json !== "object") return void 0;
-  let found;
-  const walk = (node, depth = 0) => {
-    if (found || !node || typeof node !== "object" || depth > 12) return;
-    if (Array.isArray(node)) {
-      for (const el of node) walk(el, depth + 1);
-      return;
-    }
-    const obj = node;
-    if (typeof obj.continuation === "string" && obj.continuation.length > 8) {
-      found = obj.continuation;
-      return;
-    }
-    for (const val of Object.values(obj)) {
-      if (val && typeof val === "object") walk(val, depth + 1);
-    }
-  };
-  walk(json, 0);
-  return found;
+var PAGINATION_HARD_PAGE_LIMIT = 512;
+var PAGINATION_MIN_DYNAMIC_PAGES = 64;
+var PAGINATION_ITEMS_PER_PAGE_ESTIMATE = 20;
+var PAGINATION_PAGE_MULTIPLIER = 4;
+function getPaginationSafetyLimit(itemCount, hardLimit) {
+  const normalizedHardLimit = Math.max(1, Math.floor(hardLimit));
+  const estimatedPages = Math.ceil(itemCount / PAGINATION_ITEMS_PER_PAGE_ESTIMATE);
+  const dynamicLimit = Math.max(
+    PAGINATION_MIN_DYNAMIC_PAGES,
+    estimatedPages * PAGINATION_PAGE_MULTIPLIER
+  );
+  return Math.min(normalizedHardLimit, dynamicLimit);
 }
-async function browseAllTracks(browseId, gl, hl, maxPages = 6, liked = false) {
+async function browseAllPages(opts) {
+  const {
+    browseId,
+    gl,
+    hl,
+    account,
+    parsePage,
+    getKey
+  } = opts;
+  const request = opts.request || innerTubePost;
+  const hardLimit = opts.maxPages ?? PAGINATION_HARD_PAGE_LIMIT;
   const collected = [];
   const seen = /* @__PURE__ */ new Set();
-  const firstJson = await innerTubePost({
+  const seenContinuations = /* @__PURE__ */ new Set();
+  const firstJson = await request({
     endpoint: "browse",
     body: { browseId },
     gl,
-    hl
+    hl,
+    requireAuth: true,
+    accountOverride: account
   });
-  for (const t of parseInnertubeSearchItems(firstJson)) {
-    if (!seen.has(t.ytMusicVideoId)) {
-      seen.add(t.ytMusicVideoId);
-      collected.push(toTrack2(t, liked));
-    }
+  if (!firstJson) {
+    throw new Error(
+      `YouTube Music pagination for ${browseId} returned no response; sync failed.`
+    );
   }
-  let continuation = extractContinuation(firstJson);
-  let page = 1;
-  while (continuation && page < maxPages) {
-    const nextJson = await innerTubePost({
-      endpoint: "browse",
-      body: { continuation },
-      gl,
-      hl
-    }).catch(() => null);
-    if (!nextJson) break;
-    const nextTracks = parseInnertubeSearchItems(nextJson);
-    if (nextTracks.length === 0) break;
-    for (const t of nextTracks) {
-      if (!seen.has(t.ytMusicVideoId)) {
-        seen.add(t.ytMusicVideoId);
-        collected.push(toTrack2(t, liked));
-      }
-    }
-    const nextCont = extractContinuation(nextJson);
-    if (!nextCont || nextCont === continuation) break;
-    continuation = nextCont;
-    page += 1;
-  }
-  return collected;
-}
-async function browseAllCards(browseId, fallbackKind, gl, hl, maxPages = 4) {
-  const collected = [];
-  const seen = /* @__PURE__ */ new Set();
-  const firstJson = await innerTubePost({
-    endpoint: "browse",
-    body: { browseId },
-    gl,
-    hl
-  });
-  for (const c of parseInnertubeBrowseCards(firstJson, fallbackKind)) {
-    const key = c.browseId || c.id;
+  for (const item of parsePage(firstJson)) {
+    const key = getKey(item);
     if (!seen.has(key)) {
       seen.add(key);
-      collected.push(c);
+      collected.push(item);
     }
   }
-  let continuation = extractContinuation(firstJson);
+  let continuation = extractYtMusicContinuation(firstJson, { itemShelfOnly: true });
   let page = 1;
-  while (continuation && page < maxPages) {
-    const nextJson = await innerTubePost({
+  while (continuation) {
+    if (seenContinuations.has(continuation)) {
+      throw new Error(
+        `YouTube Music pagination for ${browseId} repeated a continuation token; sync was not treated as complete.`
+      );
+    }
+    const safetyLimit = getPaginationSafetyLimit(collected.length, hardLimit);
+    if (page >= safetyLimit) {
+      return {
+        items: collected,
+        complete: false,
+        incompleteReason: `YouTube Music pagination for ${browseId} reached the safety limit of ${safetyLimit} pages; the result is incomplete.`
+      };
+    }
+    seenContinuations.add(continuation);
+    const nextJson = await request({
       endpoint: "browse",
       body: { continuation },
       gl,
-      hl
-    }).catch(() => null);
-    if (!nextJson) break;
-    const nextCards = parseInnertubeBrowseCards(nextJson, fallbackKind);
-    if (nextCards.length === 0) break;
-    for (const c of nextCards) {
-      const key = c.browseId || c.id;
+      hl,
+      requireAuth: true,
+      accountOverride: account
+    });
+    if (!nextJson) {
+      throw new Error(
+        `YouTube Music pagination for ${browseId} returned no response; sync failed.`
+      );
+    }
+    for (const item of parsePage(nextJson)) {
+      const key = getKey(item);
       if (!seen.has(key)) {
         seen.add(key);
-        collected.push(c);
+        collected.push(item);
       }
     }
-    const nextCont = extractContinuation(nextJson);
-    if (!nextCont || nextCont === continuation) break;
-    continuation = nextCont;
+    const nextContinuation = extractYtMusicContinuation(nextJson, {
+      itemShelfOnly: true
+    });
+    if (!nextContinuation) break;
+    if (nextContinuation === continuation) {
+      throw new Error(
+        `YouTube Music pagination for ${browseId} repeated a continuation token; sync was not treated as complete.`
+      );
+    }
+    continuation = nextContinuation;
     page += 1;
   }
-  return collected;
+  return { items: collected, complete: true };
 }
-async function syncYtmLibrary(opts) {
-  const active = await getActiveYtAccount();
-  if (!active) {
+async function browseAllTracksWithStatus(browseId, gl, hl, account, maxPages = PAGINATION_HARD_PAGE_LIMIT, liked = false, request = innerTubePost) {
+  return await browseAllPages({
+    browseId,
+    gl,
+    hl,
+    account,
+    maxPages,
+    request,
+    parsePage: (json) => parseInnertubeSearchItems(json).map((track) => toTrack2(track, liked)),
+    getKey: (track) => track.ytMusicVideoId || track.id
+  });
+}
+async function browseAllCardsWithStatus(browseId, fallbackKind, gl, hl, account, maxPages = PAGINATION_HARD_PAGE_LIMIT, request = innerTubePost) {
+  return await browseAllPages({
+    browseId,
+    gl,
+    hl,
+    account,
+    maxPages,
+    request,
+    parsePage: (json) => parseInnertubeBrowseCards(json, fallbackKind),
+    getKey: (card) => card.browseId || card.id
+  });
+}
+async function performYtmLibrarySync(opts) {
+  console.log("[YTM Auth] Starting YouTube Music library sync...");
+  const active = opts.account;
+  if (!active || !hasYouTubeLoginCookie(active.cookie)) {
     return {
       ok: false,
       likedTracks: [],
+      libraryTracks: [],
       playlists: [],
       savedAlbums: [],
       followedArtists: [],
       uploadedTracks: [],
       historyTracks: [],
+      complete: false,
+      playlistsComplete: false,
       syncedAt: Date.now(),
+      accountId: active?.id || null,
       error: "Sign in to YouTube Music to sync your library."
     };
   }
   const gl = (opts.gl || "US").toUpperCase();
   const hl = opts.hl || "en";
+  const request = opts.request || innerTubePost;
+  const maxPages = opts.paginationMaxPages;
   const totalSteps = 6;
+  const incompleteReasons = [];
   const emit = (phase, completed, message, inProgress = true) => {
     opts.onProgress?.({
       phase,
@@ -41390,25 +42916,47 @@ async function syncYtmLibrary(opts) {
       inProgress
     });
   };
+  const recordIncomplete = (result, label) => {
+    if (result.complete) return;
+    incompleteReasons.push(
+      `${label}: ${result.incompleteReason || "pagination safety limit reached"}`
+    );
+  };
   try {
     emit("liked", 0, "Syncing Liked Songs...");
-    let likedTracks = await browseAllTracks("VLLM", gl, hl, 8, true).catch(() => []);
-    if (likedTracks.length === 0) {
-      likedTracks = await browseAllTracks("FEmusic_liked_videos", gl, hl, 6, true).catch(
-        () => []
-      );
-    }
+    const likedResult = await browseAllTracksWithStatus(
+      "VLLM",
+      gl,
+      hl,
+      active,
+      maxPages,
+      true,
+      request
+    );
+    recordIncomplete(likedResult, "Liked songs");
+    const libraryResult = await browseAllTracksWithStatus(
+      "FEmusic_liked_videos",
+      gl,
+      hl,
+      active,
+      maxPages,
+      false,
+      request
+    );
+    recordIncomplete(libraryResult, "Library songs");
     emit("playlists", 1, "Syncing Playlists...");
-    const [likedPlCards, corpusPlCards] = await Promise.all([
-      browseAllCards("FEmusic_liked_playlists", "playlist", gl, hl, 4).catch(
-        () => []
-      ),
-      browseAllCards("FEmusic_library_corpus_playlists", "playlist", gl, hl, 4).catch(
-        () => []
-      )
-    ]);
+    const playlistManifest = await browseAllCardsWithStatus(
+      "FEmusic_liked_playlists",
+      "playlist",
+      gl,
+      hl,
+      active,
+      maxPages,
+      request
+    );
+    recordIncomplete(playlistManifest, "Playlist manifest");
     const playlistCardsMap = /* @__PURE__ */ new Map();
-    for (const c of [...likedPlCards, ...corpusPlCards]) {
+    for (const c of playlistManifest.items) {
       const bid = c.browseId || "";
       if (!bid) continue;
       const cleanId = bid.startsWith("VL") ? bid.slice(2) : bid;
@@ -41418,63 +42966,104 @@ async function syncYtmLibrary(opts) {
       }
     }
     const playlists = [];
-    const plEntries = Array.from(playlistCardsMap.values()).slice(0, 32);
+    const plEntries = Array.from(playlistCardsMap.values());
     for (const plCard of plEntries) {
       const browseId = plCard.browseId;
-      const plTracks = await browseAllTracks(browseId, gl, hl, 5, false).catch(() => []);
+      const plTrackResult = await browseAllTracksWithStatus(
+        browseId,
+        gl,
+        hl,
+        active,
+        maxPages,
+        false,
+        request
+      );
+      recordIncomplete(plTrackResult, `Playlist ${browseId} tracks`);
       playlists.push({
         browseId,
         playlistId: browseId.startsWith("VL") ? browseId.slice(2) : browseId,
         title: plCard.title,
         subtitle: plCard.subtitle,
         thumbnailUrl: plCard.thumbnailUrl,
-        tracks: plTracks
+        tracks: plTrackResult.items,
+        tracksComplete: plTrackResult.complete,
+        tracksIncompleteReason: plTrackResult.incompleteReason
       });
     }
     emit("albums", 2, "Syncing Saved Albums...");
-    const albumCards = await browseAllCards("FEmusic_liked_albums", "album", gl, hl, 4).catch(
-      () => []
+    const albumResult = await browseAllCardsWithStatus(
+      "FEmusic_liked_albums",
+      "album",
+      gl,
+      hl,
+      active,
+      maxPages,
+      request
     );
-    const savedAlbums = albumCards.map(toBrowseItem);
+    recordIncomplete(albumResult, "Saved albums");
+    const savedAlbums = albumResult.items.map(toBrowseItem);
     emit("artists", 3, "Syncing Followed Artists...");
-    const artistCards = await browseAllCards(
+    const artistResult = await browseAllCardsWithStatus(
       "FEmusic_library_corpus_artists",
       "artist",
       gl,
       hl,
-      4
-    ).catch(() => []);
-    const followedArtists = artistCards.map(toBrowseItem);
+      active,
+      maxPages,
+      request
+    );
+    recordIncomplete(artistResult, "Followed artists");
+    const followedArtists = artistResult.items.map(toBrowseItem);
     emit("uploads", 4, "Syncing Uploads...");
-    const uploadedTracks = await browseAllTracks(
+    const uploadedResult = await browseAllTracksWithStatus(
       "FEmusic_library_privately_owned_tracks",
       gl,
       hl,
-      4,
-      false
-    ).catch(() => []);
-    emit("history", 5, "Syncing Listening History...");
-    const historyTracks = await browseAllTracks("FEmusic_history", gl, hl, 2, false).catch(
-      () => []
+      active,
+      maxPages,
+      false,
+      request
     );
+    recordIncomplete(uploadedResult, "Uploads");
+    emit("history", 5, "Syncing Listening History...");
+    const historyResult = await browseAllTracksWithStatus(
+      "FEmusic_history",
+      gl,
+      hl,
+      active,
+      maxPages,
+      false,
+      request
+    );
+    recordIncomplete(historyResult, "History");
+    const complete = incompleteReasons.length === 0;
     const syncedAt = Date.now();
+    const incompleteReason = incompleteReasons.length ? incompleteReasons.join(" ") : void 0;
     opts.onProgress?.({
-      phase: "done",
+      phase: complete ? "done" : "error",
       completed: totalSteps,
       total: totalSteps,
-      message: `Synced ${likedTracks.length} liked songs & ${playlists.length} playlists`,
+      message: complete ? `Synced ${likedResult.items.length} liked songs, ${libraryResult.items.length} library songs & ${playlists.length} playlists` : `Library sync was incomplete: ${incompleteReason}`,
       inProgress: false,
-      lastSyncedAt: syncedAt
+      lastSyncedAt: complete ? syncedAt : void 0
     });
     return {
-      ok: true,
-      likedTracks,
+      // A safety-limited pagination result is diagnostic data, never a
+      // successful partial sync. Callers must not apply this snapshot.
+      ok: complete,
+      likedTracks: likedResult.items,
+      libraryTracks: libraryResult.items,
       playlists,
       savedAlbums,
       followedArtists,
-      uploadedTracks,
-      historyTracks,
-      syncedAt
+      uploadedTracks: uploadedResult.items,
+      historyTracks: historyResult.items,
+      complete,
+      playlistsComplete: playlistManifest.complete,
+      incompleteReason,
+      syncedAt,
+      accountId: active.id,
+      error: complete ? void 0 : incompleteReason
     };
   } catch (err2) {
     const message = err2 instanceof Error ? err2.message : "Library sync failed.";
@@ -41488,19 +43077,49 @@ async function syncYtmLibrary(opts) {
     return {
       ok: false,
       likedTracks: [],
+      libraryTracks: [],
       playlists: [],
       savedAlbums: [],
       followedArtists: [],
       uploadedTracks: [],
       historyTracks: [],
+      complete: false,
+      playlistsComplete: false,
       syncedAt: Date.now(),
+      accountId: active?.id || null,
       error: message
     };
   }
 }
+var activeLibrarySyncs = /* @__PURE__ */ new Map();
+async function syncYtmLibrary(opts) {
+  const account = await getActiveYtAccount();
+  if (!account) {
+    return await performYtmLibrarySync({ ...opts, account: null });
+  }
+  const existing = activeLibrarySyncs.get(account.id);
+  if (existing) return await existing;
+  const request = performYtmLibrarySync({ ...opts, account });
+  activeLibrarySyncs.set(account.id, request);
+  void request.then(
+    () => {
+      if (activeLibrarySyncs.get(account.id) === request) {
+        activeLibrarySyncs.delete(account.id);
+      }
+    },
+    () => {
+      if (activeLibrarySyncs.get(account.id) === request) {
+        activeLibrarySyncs.delete(account.id);
+      }
+    }
+  );
+  return await request;
+}
 async function setYtmLikeStatus(opts) {
   const active = await getActiveYtAccount();
-  if (!active || !opts.videoId) return { ok: false };
+  if (!active || !opts.videoId || opts.expectedAccountId && opts.expectedAccountId !== active.id) {
+    return { ok: false };
+  }
   try {
     await innerTubePost({
       endpoint: opts.liked ? "like/like" : "like/removelike",
@@ -41508,7 +43127,9 @@ async function setYtmLikeStatus(opts) {
         target: { videoId: opts.videoId }
       },
       gl: opts.gl || "US",
-      hl: opts.hl || "en"
+      hl: opts.hl || "en",
+      requireAuth: true,
+      accountOverride: active
     });
     return { ok: true };
   } catch {
@@ -42132,9 +43753,14 @@ async function mapSpotifyTrackToYtm(spTrack, gl, hl) {
     }
   };
 }
+var currentSpotifySyncProgress = null;
+function getSpotifySyncProgress() {
+  return currentSpotifySyncProgress ? { ...currentSpotifySyncProgress } : null;
+}
 async function syncSpotifyLibraryToYtm(opts) {
   const creds = await getSpotifyCredentials();
   if (!creds?.spDc) {
+    currentSpotifySyncProgress = null;
     return {
       ok: false,
       connection: null,
@@ -42148,17 +43774,47 @@ async function syncSpotifyLibraryToYtm(opts) {
   }
   const gl = opts.gl || "US";
   const hl = opts.hl || "en";
+  currentSpotifySyncProgress = {
+    phase: "fetching",
+    message: "Fetching liked songs and playlists from Spotify...",
+    completed: 0,
+    total: 100,
+    inProgress: true
+  };
   try {
     const [rawLiked, rawPlaylists, albumsArtists] = await Promise.all([
       fetchLikedSpotifyTracks(40),
       fetchUserSpotifyPlaylists(),
       fetchSavedAlbumsAndArtists()
     ]);
+    const likedSlice = rawLiked.slice(0, 30);
+    const playlistSlice = rawPlaylists.slice(0, 12);
+    const totalWork = Math.max(
+      1,
+      likedSlice.length + playlistSlice.reduce((sum, pl) => sum + Math.min(35, pl.tracks.length), 0)
+    );
+    let completedWork = 0;
+    currentSpotifySyncProgress = {
+      phase: "matching",
+      message: `Matching ${likedSlice.length} liked songs on YouTube Music...`,
+      completed: 0,
+      total: totalWork,
+      inProgress: true
+    };
     const unmatchedTracks = [];
     const likedTracks = [];
     const seenVideoIds = /* @__PURE__ */ new Set();
-    for (const spTrack of rawLiked.slice(0, 30)) {
+    for (const spTrack of likedSlice) {
+      currentSpotifySyncProgress = {
+        phase: "matching",
+        message: "Matching liked songs on YouTube Music...",
+        completed: completedWork,
+        total: totalWork,
+        currentItem: `${spTrack.artist} - ${spTrack.name}`,
+        inProgress: true
+      };
       const mapped = await mapSpotifyTrackToYtm(spTrack, gl, hl);
+      completedWork += 1;
       if (mapped.matched) {
         if (!seenVideoIds.has(mapped.matched.ytMusicVideoId || mapped.matched.id)) {
           seenVideoIds.add(mapped.matched.ytMusicVideoId || mapped.matched.id);
@@ -42169,10 +43825,19 @@ async function syncSpotifyLibraryToYtm(opts) {
       }
     }
     const playlists = [];
-    for (const pl of rawPlaylists.slice(0, 12)) {
+    for (const pl of playlistSlice) {
       const matchedPlTracks = [];
       for (const spTrack of pl.tracks.slice(0, 35)) {
+        currentSpotifySyncProgress = {
+          phase: "importing",
+          message: `Matching playlist: ${pl.name}`,
+          completed: completedWork,
+          total: totalWork,
+          currentItem: `${spTrack.artist} - ${spTrack.name}`,
+          inProgress: true
+        };
         const mapped = await mapSpotifyTrackToYtm(spTrack, gl, hl);
+        completedWork += 1;
         if (mapped.matched) {
           matchedPlTracks.push(mapped.matched);
         } else if (mapped.unmatched) {
@@ -42193,6 +43858,13 @@ async function syncSpotifyLibraryToYtm(opts) {
       unmatchedTracks,
       lastError: void 0
     });
+    currentSpotifySyncProgress = {
+      phase: "complete",
+      message: `Matched ${totalMatched} tracks across ${playlists.length} playlists`,
+      completed: totalWork,
+      total: totalWork,
+      inProgress: false
+    };
     return {
       ok: true,
       connection,
@@ -42204,6 +43876,13 @@ async function syncSpotifyLibraryToYtm(opts) {
     };
   } catch (err2) {
     const msg = err2 instanceof Error ? err2.message : "Spotify sync failed.";
+    currentSpotifySyncProgress = {
+      phase: "error",
+      message: msg,
+      completed: 0,
+      total: 0,
+      inProgress: false
+    };
     const connection = await updateSpotifyCredentials({ lastError: msg });
     return {
       ok: false,
@@ -42328,16 +44007,30 @@ async function getSpotifyStatus() {
 }
 
 // electron/ytm/index.ts
+function toYtmErrorPayload(error2) {
+  const candidate = error2;
+  const message = error2 instanceof Error && error2.message ? error2.message : "YouTube Music authentication failed.";
+  return {
+    ok: false,
+    error: message,
+    code: typeof candidate?.code === "string" && candidate.code ? candidate.code : error2 instanceof Error && error2.name ? error2.name : "YtmAuthError",
+    retryable: candidate?.retryable === true
+  };
+}
 function registerYtmIpcHandlers(params) {
   const { app, BrowserWindow, session, ipcMain, safeStorage, getMainWindow } = params;
   configureCredentialStorage({
     userDataPath: app.getPath("userData"),
     safeStorage
   });
-  configureElectronYtmCookieRefresh(() => session.fromPartition(YTM_PARTITION));
+  configureElectronYtmCookieRefresh(
+    (account) => session.fromPartition(account.partitionName?.trim() || YTM_PARTITION)
+  );
   configureBotGuardWindowFactory({
     createHiddenWindow: async (url) => {
-      const ses = session.fromPartition(YTM_PARTITION);
+      const active = await getActiveYtAccount();
+      const partitionName = active?.partitionName?.trim() || YTM_PARTITION;
+      const ses = session.fromPartition(partitionName);
       attachCleanChromeHeaders(ses);
       const win = new BrowserWindow({
         show: false,
@@ -42347,7 +44040,7 @@ function registerYtmIpcHandlers(params) {
           contextIsolation: true,
           nodeIntegration: false,
           sandbox: true,
-          partition: YTM_PARTITION
+          partition: partitionName
         }
       });
       try {
@@ -42378,16 +44071,43 @@ function registerYtmIpcHandlers(params) {
   configureSpotifyBearerCaptureFallback(
     createElectronSpotifyBearerCapturer({ BrowserWindow, session })
   );
-  ipcMain.handle("auth:ytm:status", () => getYtmAuthStatus());
+  ipcMain.handle("auth:ytm:status", async () => {
+    return await restoreYtmAccountFromSession(session);
+  });
+  ipcMain.handle("auth:ytm:vault-diagnostic", () => getVaultDiagnostic());
+  ipcMain.handle("auth:ytm:invalidate-vault-cache", async () => {
+    await invalidateVaultCache();
+    return { ok: true };
+  });
+  ipcMain.handle("auth:ytm:reset-vault", async () => {
+    try {
+      const result = await resetYtVaultWithBackup();
+      return { ok: true, ...result };
+    } catch (error2) {
+      return toYtmErrorPayload(error2);
+    }
+  });
+  ipcMain.handle("auth:ytm:reset", async () => {
+    try {
+      const status = await resetYtmAuth(session);
+      return { ok: true, status };
+    } catch (error2) {
+      return toYtmErrorPayload(error2);
+    }
+  });
   ipcMain.handle(
     "auth:ytm:login",
     async (_ev, payload) => {
-      return await loginYouTubeMusicWindow({
-        BrowserWindow,
-        session,
-        parentWindow: getMainWindow(),
-        cleanPartition: Boolean(payload?.cleanPartition)
-      });
+      try {
+        return await loginYouTubeMusicWindow({
+          BrowserWindow,
+          session,
+          parentWindow: getMainWindow(),
+          cleanPartition: payload?.cleanPartition === true
+        });
+      } catch (error2) {
+        return toYtmErrorPayload(error2);
+      }
     }
   );
   ipcMain.handle("auth:ytm:cancel", () => {
@@ -42397,14 +44117,32 @@ function registerYtmIpcHandlers(params) {
   ipcMain.handle(
     "auth:ytm:import-browser",
     async (_ev, payload) => {
-      return await importYtmSessionFallback(payload || { cookieHeader: "" });
+      const safePayload = {
+        cookieHeader: typeof payload?.cookieHeader === "string" ? payload.cookieHeader : "",
+        visitorData: typeof payload?.visitorData === "string" ? payload.visitorData : void 0,
+        dataSyncId: typeof payload?.dataSyncId === "string" ? payload.dataSyncId : void 0,
+        accountIndex: typeof payload?.accountIndex === "number" ? payload.accountIndex : void 0
+      };
+      try {
+        return await importYtmSessionFallback(safePayload);
+      } catch (error2) {
+        return toYtmErrorPayload(error2);
+      }
     }
   );
   ipcMain.handle("auth:ytm:switch", async (_ev, accountId) => {
-    return await switchYtmAccount(accountId);
+    try {
+      return await switchYtmAccount(accountId);
+    } catch (error2) {
+      return toYtmErrorPayload(error2);
+    }
   });
   ipcMain.handle("auth:ytm:logout", async (_ev, accountId) => {
-    return await logoutYtmAccount({ session, accountId });
+    try {
+      return await logoutYtmAccount({ session, accountId });
+    } catch (error2) {
+      return toYtmErrorPayload(error2);
+    }
   });
   ipcMain.handle("auth:spotify:status", () => getSpotifyStatus());
   ipcMain.handle("auth:spotify:login", async () => {
@@ -42420,7 +44158,6 @@ function registerYtmIpcHandlers(params) {
   ipcMain.handle(
     "library:sync",
     async (_ev, payload) => {
-      console.log("[YTM Auth] Starting YouTube Music library sync...");
       return await syncYtmLibrary({
         gl: payload?.gl,
         hl: payload?.hl,
@@ -42487,6 +44224,9 @@ function registerYtmIpcHandlers(params) {
       return await syncSpotifyLibraryToYtm(payload || {});
     }
   );
+  ipcMain.handle("spotify:sync-progress", () => {
+    return getSpotifySyncProgress();
+  });
   ipcMain.handle(
     "spotify:import-playlist",
     async (_ev, payload) => {
