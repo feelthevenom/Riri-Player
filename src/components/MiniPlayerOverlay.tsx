@@ -119,7 +119,7 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
     secondary: string;
   } | null>(null);
   const [isMuted, setIsMuted] = useState(false);
-  const [showLyrics, setShowLyrics] = useState(false);
+  const [showLyrics, setShowLyrics] = useState(true);
   const lastNonZeroVolumeRef = useRef<number>(volume > 0 ? volume : 0.85);
 
   useEffect(() => {

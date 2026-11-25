@@ -86,6 +86,11 @@ app.commandLine.appendSwitch(
   'disable-features',
   'WebAuthentication,WebAuthenticationConditionalUI,WebAuthn',
 );
+// Keep Electron/Chromium RAM usage lean
+app.commandLine.appendSwitch('js-flags', '--max-old-space-size=384');
+app.commandLine.appendSwitch('disk-cache-size', String(50 * 1024 * 1024));
+app.commandLine.appendSwitch('media-cache-size', String(50 * 1024 * 1024));
+app.commandLine.appendSwitch('renderer-process-limit', '2');
 
 // Default YouTube Music login mode to 'native' (works better than 'firefox' fallback)
 if (!process.env.RIRI_YTM_LOGIN_MODE) {
@@ -300,6 +305,7 @@ function toggleOverlayWindow() {
     skipTaskbar: false,
     resizable: false,
     hasShadow: false,
+    fullscreenable: false,
     icon: iconPath,
     backgroundColor: '#00000000',
     webPreferences: {
@@ -310,6 +316,19 @@ function toggleOverlayWindow() {
     },
   });
 
+  // Pin mini-player at screen-saver level so it stays above fullscreen games and other apps
+  const enforceOverlayTopmost = () => {
+    if (overlayWindow && !overlayWindow.isDestroyed()) {
+      overlayWindow.setAlwaysOnTop(true, 'screen-saver', 1);
+    }
+  };
+  enforceOverlayTopmost();
+  overlayWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  overlayWindow.once('ready-to-show', enforceOverlayTopmost);
+  overlayWindow.on('show', enforceOverlayTopmost);
+  overlayWindow.on('blur', enforceOverlayTopmost);
+  const topmostInterval = setInterval(enforceOverlayTopmost, 2000);
+
   const isDev = !app.isPackaged;
   const targetUrl = isDev
     ? 'http://localhost:3000/#/mini-overlay'
@@ -318,6 +337,7 @@ function toggleOverlayWindow() {
   overlayWindow.loadURL(targetUrl);
 
   overlayWindow.on('closed', () => {
+    clearInterval(topmostInterval);
     overlayWindow = null;
     if (mainWindow && !mainWindow.isDestroyed()) {
       if (mainWindow.isMinimized()) mainWindow.restore();

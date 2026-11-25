@@ -136,7 +136,7 @@ export const UpNextQueueView: React.FC<UpNextQueueViewProps> = ({
 
                 <button
                   type="button"
-                  onClick={() => void playTrack(t, queue)}
+                  onClick={() => void playTrack(t, queue, { preserveQueueMode: true })}
                   className="flex-1 min-w-0 text-left cursor-pointer"
                 >
                   <div

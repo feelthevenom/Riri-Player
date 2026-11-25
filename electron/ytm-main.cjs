@@ -216,6 +216,40 @@ function parseInnertubeNext(json) {
   }
   return null;
 }
+function upgradeThumbnailUrl(rawUrl) {
+  if (!rawUrl) return rawUrl;
+  let upgraded = rawUrl.trim();
+  if (/^https?:\/\/(lh3\.googleusercontent\.com|yt3\.ggpht\.com|yt3\.googleusercontent\.com)\//i.test(upgraded)) {
+    if (/=w\d+-h\d+/i.test(upgraded)) {
+      upgraded = upgraded.replace(/=w\d+-h\d+([^?\s]*)/i, (_m, rest) => {
+        const updatedRest = String(rest || "").replace(/-l\d+/i, "-l100");
+        return `=w1200-h1200${updatedRest}`;
+      });
+    } else if (/=s\d+/i.test(upgraded)) {
+      upgraded = upgraded.replace(/=s\d+/i, "=s1200");
+    }
+  } else if (/^https?:\/\/i\d*\.ytimg\.com\/vi(?:_webp)?\/[^/]+\/(?:default|mqdefault|hqdefault|sddefault)\.(jpg|webp)/i.test(upgraded)) {
+    upgraded = upgraded.replace(
+      /\/(default|mqdefault|hqdefault|sddefault)\.(jpg|webp)/i,
+      "/maxresdefault.$2"
+    );
+  }
+  return upgraded;
+}
+function pickBestThumbnailUrl(thumbs) {
+  if (!Array.isArray(thumbs) || thumbs.length === 0) return "";
+  let best = thumbs[thumbs.length - 1];
+  let bestArea = (best?.width || 0) * (best?.height || 0);
+  for (const t of thumbs) {
+    const area = (t?.width || 0) * (t?.height || 0);
+    if (t?.url && area > bestArea) {
+      best = t;
+      bestArea = area;
+    }
+  }
+  const raw = String(best?.url || thumbs[0]?.url || "");
+  return raw ? upgradeThumbnailUrl(raw) : "";
+}
 function parsePlaylistPanelVideoRenderer(renderer) {
   const videoId = renderer.videoId || "";
   if (!videoId) return null;
@@ -255,8 +289,8 @@ function parsePlaylistPanelVideoRenderer(renderer) {
   const lengthText = (lengthRuns ? lengthRuns.map((r) => String(r.text || "")).join("").trim() : "") || String(renderer.lengthText?.simpleText || "") || "3:00";
   const durationSec = parseDurationTextToSec(lengthText);
   const thumbnail = renderer.thumbnail?.thumbnails || [];
-  const rawThumb = thumbnail.length > 0 ? String(thumbnail[thumbnail.length - 1].url || thumbnail[0].url || "") : "";
-  const thumbSource = rawThumb || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+  const rawThumb = pickBestThumbnailUrl(thumbnail);
+  const thumbSource = rawThumb || `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`;
   const thumbnailUrl = `/api/proxy-image?url=${encodeURIComponent(thumbSource)}`;
   const streamParams = new URLSearchParams({
     videoId,
@@ -359,7 +393,7 @@ function normalizeTrackFromListItem(r) {
     durationSec = parseDurationTextToSec(fixedDur);
   }
   const thumbs = r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || rAny.thumbnail?.thumbnails || [];
-  const bestThumb = thumbs[thumbs.length - 1]?.url || thumbs[0]?.url || "";
+  const bestThumb = pickBestThumbnailUrl(thumbs);
   const proxiedArt = bestThumb ? `/api/proxy-image?url=${encodeURIComponent(bestThumb)}` : "";
   if (rAny.lengthSeconds && !isNaN(parseInt(rAny.lengthSeconds, 10))) {
     durationSec = parseInt(rAny.lengthSeconds, 10);
@@ -428,7 +462,7 @@ function normalizeTwoRowCard(item, fallbackKind = "playlist") {
   if (!title) return null;
   const subtitle = (item.subtitle?.runs || []).map((r) => r.text || "").join("").replace(/\s+/g, " ").trim();
   const thumbs = item.thumbnailRenderer?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
-  const rawThumb = thumbs[thumbs.length - 1]?.url || thumbs[0]?.url || "";
+  const rawThumb = pickBestThumbnailUrl(thumbs);
   const thumbnailUrl = rawThumb ? `/api/proxy-image?url=${encodeURIComponent(rawThumb)}` : "";
   const browseId = item.navigationEndpoint?.browseEndpoint?.browseId;
   const params = item.navigationEndpoint?.browseEndpoint?.params;
@@ -505,7 +539,7 @@ function normalizeBrowseCardFromListItem(r, fallbackKind = "playlist") {
   if (!title) return null;
   const subtitle = [...flex1, ...flex2].map((x2) => x2.text || "").join("").replace(/\s+/g, " ").trim();
   const thumbs = r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || rAny.thumbnail?.thumbnails || [];
-  const rawThumb = thumbs[thumbs.length - 1]?.url || thumbs[0]?.url || "";
+  const rawThumb = pickBestThumbnailUrl(thumbs);
   const thumbnailUrl = rawThumb ? `/api/proxy-image?url=${encodeURIComponent(rawThumb)}` : "";
   const rootNav = r.navigationEndpoint || rAny.navigationEndpoint;
   const flex0Nav = flex0[0]?.navigationEndpoint;
@@ -558,7 +592,7 @@ function parseInnertubeBrowseCards(json, fallbackKind = "playlist") {
       const subtitleRuns = cardShelf.subtitle?.runs || [];
       const subtitle = subtitleRuns.map((r) => r.text || "").join("").replace(/\s+/g, " ").trim();
       const thumbs = cardShelf.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
-      const rawThumb = thumbs[thumbs.length - 1]?.url || thumbs[0]?.url || "";
+      const rawThumb = pickBestThumbnailUrl(thumbs);
       const thumbnailUrl = rawThumb ? `/api/proxy-image?url=${encodeURIComponent(rawThumb)}` : "";
       const nav = titleRuns[0]?.navigationEndpoint;
       const rawBrowseId = nav?.browseEndpoint?.browseId;
@@ -42486,7 +42520,7 @@ function getCollectionHeaderThumbnail(header) {
   const renderer = thumbnail?.croppedSquareThumbnailRenderer || thumbnail?.musicThumbnailRenderer || thumbnail;
   if (!renderer) return "";
   const thumbs = renderer.thumbnail?.thumbnails || renderer.thumbnails || [];
-  const rawThumb = thumbs[thumbs.length - 1]?.url || thumbs[0]?.url || "";
+  const rawThumb = pickBestThumbnailUrl(thumbs);
   return rawThumb ? `/api/proxy-image?url=${encodeURIComponent(rawThumb)}` : "";
 }
 function parseYtmCollectionResponse(json, browseId) {
@@ -43719,9 +43753,14 @@ async function mapSpotifyTrackToYtm(spTrack, gl, hl) {
     }
   };
 }
+var currentSpotifySyncProgress = null;
+function getSpotifySyncProgress() {
+  return currentSpotifySyncProgress ? { ...currentSpotifySyncProgress } : null;
+}
 async function syncSpotifyLibraryToYtm(opts) {
   const creds = await getSpotifyCredentials();
   if (!creds?.spDc) {
+    currentSpotifySyncProgress = null;
     return {
       ok: false,
       connection: null,
@@ -43735,17 +43774,47 @@ async function syncSpotifyLibraryToYtm(opts) {
   }
   const gl = opts.gl || "US";
   const hl = opts.hl || "en";
+  currentSpotifySyncProgress = {
+    phase: "fetching",
+    message: "Fetching liked songs and playlists from Spotify...",
+    completed: 0,
+    total: 100,
+    inProgress: true
+  };
   try {
     const [rawLiked, rawPlaylists, albumsArtists] = await Promise.all([
       fetchLikedSpotifyTracks(40),
       fetchUserSpotifyPlaylists(),
       fetchSavedAlbumsAndArtists()
     ]);
+    const likedSlice = rawLiked.slice(0, 30);
+    const playlistSlice = rawPlaylists.slice(0, 12);
+    const totalWork = Math.max(
+      1,
+      likedSlice.length + playlistSlice.reduce((sum, pl) => sum + Math.min(35, pl.tracks.length), 0)
+    );
+    let completedWork = 0;
+    currentSpotifySyncProgress = {
+      phase: "matching",
+      message: `Matching ${likedSlice.length} liked songs on YouTube Music...`,
+      completed: 0,
+      total: totalWork,
+      inProgress: true
+    };
     const unmatchedTracks = [];
     const likedTracks = [];
     const seenVideoIds = /* @__PURE__ */ new Set();
-    for (const spTrack of rawLiked.slice(0, 30)) {
+    for (const spTrack of likedSlice) {
+      currentSpotifySyncProgress = {
+        phase: "matching",
+        message: "Matching liked songs on YouTube Music...",
+        completed: completedWork,
+        total: totalWork,
+        currentItem: `${spTrack.artist} - ${spTrack.name}`,
+        inProgress: true
+      };
       const mapped = await mapSpotifyTrackToYtm(spTrack, gl, hl);
+      completedWork += 1;
       if (mapped.matched) {
         if (!seenVideoIds.has(mapped.matched.ytMusicVideoId || mapped.matched.id)) {
           seenVideoIds.add(mapped.matched.ytMusicVideoId || mapped.matched.id);
@@ -43756,10 +43825,19 @@ async function syncSpotifyLibraryToYtm(opts) {
       }
     }
     const playlists = [];
-    for (const pl of rawPlaylists.slice(0, 12)) {
+    for (const pl of playlistSlice) {
       const matchedPlTracks = [];
       for (const spTrack of pl.tracks.slice(0, 35)) {
+        currentSpotifySyncProgress = {
+          phase: "importing",
+          message: `Matching playlist: ${pl.name}`,
+          completed: completedWork,
+          total: totalWork,
+          currentItem: `${spTrack.artist} - ${spTrack.name}`,
+          inProgress: true
+        };
         const mapped = await mapSpotifyTrackToYtm(spTrack, gl, hl);
+        completedWork += 1;
         if (mapped.matched) {
           matchedPlTracks.push(mapped.matched);
         } else if (mapped.unmatched) {
@@ -43780,6 +43858,13 @@ async function syncSpotifyLibraryToYtm(opts) {
       unmatchedTracks,
       lastError: void 0
     });
+    currentSpotifySyncProgress = {
+      phase: "complete",
+      message: `Matched ${totalMatched} tracks across ${playlists.length} playlists`,
+      completed: totalWork,
+      total: totalWork,
+      inProgress: false
+    };
     return {
       ok: true,
       connection,
@@ -43791,6 +43876,13 @@ async function syncSpotifyLibraryToYtm(opts) {
     };
   } catch (err2) {
     const msg = err2 instanceof Error ? err2.message : "Spotify sync failed.";
+    currentSpotifySyncProgress = {
+      phase: "error",
+      message: msg,
+      completed: 0,
+      total: 0,
+      inProgress: false
+    };
     const connection = await updateSpotifyCredentials({ lastError: msg });
     return {
       ok: false,
@@ -44132,6 +44224,9 @@ function registerYtmIpcHandlers(params) {
       return await syncSpotifyLibraryToYtm(payload || {});
     }
   );
+  ipcMain.handle("spotify:sync-progress", () => {
+    return getSpotifySyncProgress();
+  });
   ipcMain.handle(
     "spotify:import-playlist",
     async (_ev, payload) => {

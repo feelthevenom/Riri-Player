@@ -1168,7 +1168,7 @@ export async function startAppServer(opts: StartAppServerOptions = {}): Promise<
     return res.status(404).json({ ok: false, error: 'No full-length audio stream available' });
   });
 
-  // ── Image Proxy (SSRF-hardened) ────────────────────────────────────────────
+  // ── Image Proxy (SSRF-hardened + highest-quality artwork upgrade) ─────────
   app.get('/api/proxy-image', async (req, res) => {
     const rawUrl = String(req.query.url || '').trim();
     const parsed = parseSafeExternalUrl(rawUrl);
@@ -1177,29 +1177,63 @@ export async function startAppServer(opts: StartAppServerOptions = {}): Promise<
       return;
     }
 
+    const originalStr = parsed.toString();
+    const candidateUrls: string[] = [];
+    if (/^https?:\/\/(lh3\.googleusercontent\.com|yt3\.ggpht\.com|yt3\.googleusercontent\.com)\//i.test(originalStr)) {
+      let upgraded = originalStr;
+      if (/=w\d+-h\d+/i.test(upgraded)) {
+        upgraded = upgraded.replace(/=w\d+-h\d+([^?\s]*)/i, (_m, rest) => {
+          const updatedRest = String(rest || '').replace(/-l\d+/i, '-l100');
+          return `=w1200-h1200${updatedRest}`;
+        });
+      } else if (/=s\d+/i.test(upgraded)) {
+        upgraded = upgraded.replace(/=s\d+/i, '=s1200');
+      }
+      candidateUrls.push(upgraded);
+      if (upgraded !== originalStr) candidateUrls.push(originalStr);
+    } else if (/^https?:\/\/i\d*\.ytimg\.com\/vi(?:_webp)?\/[^/]+\/(?:default|mqdefault|hqdefault|sddefault|maxresdefault)\.(jpg|webp)/i.test(originalStr)) {
+      candidateUrls.push(
+        originalStr.replace(/\/(default|mqdefault|hqdefault|sddefault|maxresdefault)\.(jpg|webp)/i, '/maxresdefault.$2'),
+        originalStr.replace(/\/(default|mqdefault|hqdefault|sddefault|maxresdefault)\.(jpg|webp)/i, '/sddefault.$2'),
+        originalStr.replace(/\/(default|mqdefault|hqdefault|sddefault|maxresdefault)\.(jpg|webp)/i, '/hqdefault.$2'),
+      );
+      if (!candidateUrls.includes(originalStr)) candidateUrls.push(originalStr);
+    } else {
+      candidateUrls.push(originalStr);
+    }
+
+    const headers = {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
+      Referer: 'https://music.youtube.com/',
+    };
+
     try {
-      const upstream = await fetch(parsed.toString(), {
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
-          Referer: 'https://music.youtube.com/',
-        },
-        signal: AbortSignal.timeout(10000),
-      });
-      if (!upstream.ok) {
-        res.status(upstream.status).end();
+      let lastStatus = 502;
+      for (const targetUrl of candidateUrls) {
+        const safeTarget = parseSafeExternalUrl(targetUrl);
+        if (!safeTarget) continue;
+        const upstream = await fetch(safeTarget.toString(), {
+          headers,
+          signal: AbortSignal.timeout(10000),
+        });
+        if (!upstream.ok) {
+          lastStatus = upstream.status;
+          continue;
+        }
+        const ctype = upstream.headers.get('content-type') || 'image/jpeg';
+        if (!ctype.startsWith('image/')) {
+          lastStatus = 415;
+          continue;
+        }
+        res.setHeader('Content-Type', ctype);
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+        const buf = Buffer.from(await upstream.arrayBuffer());
+        res.send(buf);
         return;
       }
-      const ctype = upstream.headers.get('content-type') || 'image/jpeg';
-      if (!ctype.startsWith('image/')) {
-        res.status(415).end();
-        return;
-      }
-      res.setHeader('Content-Type', ctype);
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Cache-Control', 'public, max-age=86400');
-      const buf = Buffer.from(await upstream.arrayBuffer());
-      res.send(buf);
+      res.status(lastStatus).end();
     } catch {
       res.status(502).end();
     }
@@ -1432,6 +1466,10 @@ export async function startAppServer(opts: StartAppServerOptions = {}): Promise<
       hl: req.body?.hl || 'en',
     });
     res.status(out.ok ? 200 : 400).json(out);
+  });
+
+  app.get('/api/spotify/sync-progress', (_req, res) => {
+    res.json({ ok: true, progress: getSpotifySyncProgress() });
   });
 
   app.post('/api/spotify/import-playlist', async (req, res) => {
@@ -2062,4 +2100,4 @@ if (
 }
 
 // Need to import these from electron/ytm/spotify
-import { getSpotifyStatus, logoutSpotifyAccount, resolveManualSpotifyTrackList, setSpotifySyncSchedule, syncSpotifyLibraryToYtm } from './electron/ytm/spotify';
+import { getSpotifyStatus, getSpotifySyncProgress, logoutSpotifyAccount, resolveManualSpotifyTrackList, setSpotifySyncSchedule, syncSpotifyLibraryToYtm } from './electron/ytm/spotify';

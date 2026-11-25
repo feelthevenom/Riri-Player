@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import type {
   SpotifyConnection,
+  SpotifySyncProgress,
   SpotifySyncSchedule,
   Track,
   UnmatchedSpotifyTrack,
@@ -823,6 +824,12 @@ async function mapSpotifyTrackToYtm(
   };
 }
 
+let currentSpotifySyncProgress: SpotifySyncProgress | null = null;
+
+export function getSpotifySyncProgress(): SpotifySyncProgress | null {
+  return currentSpotifySyncProgress ? { ...currentSpotifySyncProgress } : null;
+}
+
 export async function syncSpotifyLibraryToYtm(opts: {
   gl?: string;
   hl?: string;
@@ -838,6 +845,7 @@ export async function syncSpotifyLibraryToYtm(opts: {
 }> {
   const creds = await getSpotifyCredentials();
   if (!creds?.spDc) {
+    currentSpotifySyncProgress = null;
     return {
       ok: false,
       connection: null,
@@ -853,6 +861,14 @@ export async function syncSpotifyLibraryToYtm(opts: {
   const gl = opts.gl || 'US';
   const hl = opts.hl || 'en';
 
+  currentSpotifySyncProgress = {
+    phase: 'fetching',
+    message: 'Fetching liked songs and playlists from Spotify...',
+    completed: 0,
+    total: 100,
+    inProgress: true,
+  };
+
   try {
     const [rawLiked, rawPlaylists, albumsArtists] = await Promise.all([
       fetchLikedSpotifyTracks(40),
@@ -860,12 +876,37 @@ export async function syncSpotifyLibraryToYtm(opts: {
       fetchSavedAlbumsAndArtists(),
     ]);
 
+    const likedSlice = rawLiked.slice(0, 30);
+    const playlistSlice = rawPlaylists.slice(0, 12);
+    const totalWork = Math.max(
+      1,
+      likedSlice.length + playlistSlice.reduce((sum, pl) => sum + Math.min(35, pl.tracks.length), 0),
+    );
+    let completedWork = 0;
+
+    currentSpotifySyncProgress = {
+      phase: 'matching',
+      message: `Matching ${likedSlice.length} liked songs on YouTube Music...`,
+      completed: 0,
+      total: totalWork,
+      inProgress: true,
+    };
+
     const unmatchedTracks: UnmatchedSpotifyTrack[] = [];
     const likedTracks: Track[] = [];
     const seenVideoIds = new Set<string>();
 
-    for (const spTrack of rawLiked.slice(0, 30)) {
+    for (const spTrack of likedSlice) {
+      currentSpotifySyncProgress = {
+        phase: 'matching',
+        message: 'Matching liked songs on YouTube Music...',
+        completed: completedWork,
+        total: totalWork,
+        currentItem: `${spTrack.artist} - ${spTrack.name}`,
+        inProgress: true,
+      };
       const mapped = await mapSpotifyTrackToYtm(spTrack, gl, hl);
+      completedWork += 1;
       if (mapped.matched) {
         if (!seenVideoIds.has(mapped.matched.ytMusicVideoId || mapped.matched.id)) {
           seenVideoIds.add(mapped.matched.ytMusicVideoId || mapped.matched.id);
@@ -883,10 +924,19 @@ export async function syncSpotifyLibraryToYtm(opts: {
       spotifyId: string;
     }> = [];
 
-    for (const pl of rawPlaylists.slice(0, 12)) {
+    for (const pl of playlistSlice) {
       const matchedPlTracks: Track[] = [];
       for (const spTrack of pl.tracks.slice(0, 35)) {
+        currentSpotifySyncProgress = {
+          phase: 'importing',
+          message: `Matching playlist: ${pl.name}`,
+          completed: completedWork,
+          total: totalWork,
+          currentItem: `${spTrack.artist} - ${spTrack.name}`,
+          inProgress: true,
+        };
         const mapped = await mapSpotifyTrackToYtm(spTrack, gl, hl);
+        completedWork += 1;
         if (mapped.matched) {
           matchedPlTracks.push(mapped.matched);
         } else if (mapped.unmatched) {
@@ -913,6 +963,14 @@ export async function syncSpotifyLibraryToYtm(opts: {
       lastError: undefined,
     });
 
+    currentSpotifySyncProgress = {
+      phase: 'complete',
+      message: `Matched ${totalMatched} tracks across ${playlists.length} playlists`,
+      completed: totalWork,
+      total: totalWork,
+      inProgress: false,
+    };
+
     return {
       ok: true,
       connection,
@@ -924,6 +982,13 @@ export async function syncSpotifyLibraryToYtm(opts: {
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Spotify sync failed.';
+    currentSpotifySyncProgress = {
+      phase: 'error',
+      message: msg,
+      completed: 0,
+      total: 0,
+      inProgress: false,
+    };
     const connection = await updateSpotifyCredentials({ lastError: msg });
     return {
       ok: false,

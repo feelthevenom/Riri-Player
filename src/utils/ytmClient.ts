@@ -191,6 +191,7 @@ export interface ElectronYtmBridge {
       unmatchedTracks: UnmatchedSpotifyTrack[];
       error?: string;
     }>;
+    syncProgress?: () => Promise<import('../types/music').SpotifySyncProgress | null>;
     importPlaylist: (payload: { input: string; gl?: string; hl?: string }) => Promise<{
       ok: boolean;
       playlistName: string;
@@ -841,6 +842,23 @@ export const ytmClient = {
       savedAlbums: (data.savedAlbums || []).map(decorateBrowseThumb),
       followedArtists: (data.followedArtists || []).map(decorateBrowseThumb),
     };
+  },
+
+  async getSpotifySyncProgress(): Promise<import('../types/music').SpotifySyncProgress | null> {
+    const api = getElectronBridge();
+    if (api?.spotify?.syncProgress) {
+      return await api.spotify.syncProgress();
+    }
+    try {
+      const res = await apiFetch('/api/spotify/sync-progress');
+      const data = (await res.json()) as {
+        ok?: boolean;
+        progress?: import('../types/music').SpotifySyncProgress | null;
+      };
+      return data.progress || null;
+    } catch {
+      return null;
+    }
   },
 
   async importSpotifyPlaylist(input: string, gl = 'US', hl = 'en') {

@@ -84,7 +84,7 @@ test('album collection artwork is retained and used as the track fallback', () =
   };
 
   const parsed = parseYtmCollectionResponse(response, 'MPREb_RgVXsiZnUCs');
-  const expectedArtwork = `/api/proxy-image?url=${encodeURIComponent(albumArtworkUrl)}`;
+  const expectedArtwork = `/api/proxy-image?url=${encodeURIComponent('https://lh3.googleusercontent.com/album-cover=w1200-h1200')}`;
 
   assert.equal(parsed.title, 'Coolie (Original Motion Picture Soundtrack)');
   assert.equal(parsed.thumbnailUrl, expectedArtwork);

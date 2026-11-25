@@ -100,6 +100,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   spotify: {
     sync: (payload) => ipcRenderer.invoke('spotify:sync', payload),
+    syncProgress: () => ipcRenderer.invoke('spotify:sync-progress'),
     importPlaylist: (payload) => ipcRenderer.invoke('spotify:import-playlist', payload),
     setSchedule: (schedule) => ipcRenderer.invoke('spotify:set-schedule', schedule),
     dismissUnmatched: (trackId) => ipcRenderer.invoke('spotify:dismiss-unmatched', trackId),

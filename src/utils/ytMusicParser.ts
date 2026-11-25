@@ -294,6 +294,47 @@ export function parseInnertubeNext(json: unknown): YtMusicNextResult | null {
   return null;
 }
 
+/**
+ * Upgrades Google/YouTube thumbnail URLs to their highest available resolution.
+ */
+export function upgradeThumbnailUrl(rawUrl: string): string {
+  if (!rawUrl) return rawUrl;
+  let upgraded = rawUrl.trim();
+  if (/^https?:\/\/(lh3\.googleusercontent\.com|yt3\.ggpht\.com|yt3\.googleusercontent\.com)\//i.test(upgraded)) {
+    if (/=w\d+-h\d+/i.test(upgraded)) {
+      upgraded = upgraded.replace(/=w\d+-h\d+([^?\s]*)/i, (_m, rest) => {
+        const updatedRest = String(rest || '').replace(/-l\d+/i, '-l100');
+        return `=w1200-h1200${updatedRest}`;
+      });
+    } else if (/=s\d+/i.test(upgraded)) {
+      upgraded = upgraded.replace(/=s\d+/i, '=s1200');
+    }
+  } else if (/^https?:\/\/i\d*\.ytimg\.com\/vi(?:_webp)?\/[^/]+\/(?:default|mqdefault|hqdefault|sddefault)\.(jpg|webp)/i.test(upgraded)) {
+    upgraded = upgraded.replace(
+      /\/(default|mqdefault|hqdefault|sddefault)\.(jpg|webp)/i,
+      '/maxresdefault.$2',
+    );
+  }
+  return upgraded;
+}
+
+export function pickBestThumbnailUrl(
+  thumbs: Array<{ url?: string; width?: number; height?: number }> | undefined,
+): string {
+  if (!Array.isArray(thumbs) || thumbs.length === 0) return '';
+  let best = thumbs[thumbs.length - 1];
+  let bestArea = (best?.width || 0) * (best?.height || 0);
+  for (const t of thumbs) {
+    const area = (t?.width || 0) * (t?.height || 0);
+    if (t?.url && area > bestArea) {
+      best = t;
+      bestArea = area;
+    }
+  }
+  const raw = String(best?.url || thumbs[0]?.url || '');
+  return raw ? upgradeThumbnailUrl(raw) : '';
+}
+
 function parsePlaylistPanelVideoRenderer(renderer: Record<string, unknown>): NormalizedYtTrack | null {
   const videoId = (renderer.videoId as string) || '';
   if (!videoId) return null;
@@ -351,12 +392,13 @@ function parsePlaylistPanelVideoRenderer(renderer: Record<string, unknown>): Nor
   const durationSec = parseDurationTextToSec(lengthText);
 
   const thumbnail =
-    ((renderer.thumbnail as Record<string, unknown> | undefined)?.thumbnails as Array<
-      Record<string, unknown>
-    >) || [];
-  const rawThumb =
-    thumbnail.length > 0 ? String(thumbnail[thumbnail.length - 1].url || thumbnail[0].url || '') : '';
-  const thumbSource = rawThumb || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+    ((renderer.thumbnail as Record<string, unknown> | undefined)?.thumbnails as Array<{
+      url?: string;
+      width?: number;
+      height?: number;
+    }>) || [];
+  const rawThumb = pickBestThumbnailUrl(thumbnail);
+  const thumbSource = rawThumb || `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`;
   const thumbnailUrl = `/api/proxy-image?url=${encodeURIComponent(thumbSource)}`;
 
   const streamParams = new URLSearchParams({
@@ -616,7 +658,7 @@ function normalizeTrackFromListItem(r: MusicListItemRenderer): NormalizedYtTrack
     r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails ||
     rAny.thumbnail?.thumbnails ||
     [];
-  const bestThumb = thumbs[thumbs.length - 1]?.url || thumbs[0]?.url || '';
+  const bestThumb = pickBestThumbnailUrl(thumbs);
   const proxiedArt = bestThumb ? `/api/proxy-image?url=${encodeURIComponent(bestThumb)}` : '';
 
   if (rAny.lengthSeconds && !isNaN(parseInt(rAny.lengthSeconds, 10))) {
@@ -703,7 +745,7 @@ function normalizeTwoRowCard(
     .trim();
 
   const thumbs = item.thumbnailRenderer?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
-  const rawThumb = thumbs[thumbs.length - 1]?.url || thumbs[0]?.url || '';
+  const rawThumb = pickBestThumbnailUrl(thumbs);
   const thumbnailUrl = rawThumb ? `/api/proxy-image?url=${encodeURIComponent(rawThumb)}` : '';
 
   const browseId = item.navigationEndpoint?.browseEndpoint?.browseId;
@@ -818,9 +860,9 @@ export function normalizeBrowseCardFromListItem(
 
   const thumbs =
     r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails ||
-    (rAny.thumbnail as { thumbnails?: Array<{ url: string }> })?.thumbnails ||
+    (rAny.thumbnail as { thumbnails?: Array<{ url: string; width?: number; height?: number }> })?.thumbnails ||
     [];
-  const rawThumb = thumbs[thumbs.length - 1]?.url || thumbs[0]?.url || '';
+  const rawThumb = pickBestThumbnailUrl(thumbs);
   const thumbnailUrl = rawThumb ? `/api/proxy-image?url=${encodeURIComponent(rawThumb)}` : '';
 
   const rootNav = ((r as Record<string, unknown>).navigationEndpoint || rAny.navigationEndpoint) as
@@ -913,10 +955,10 @@ export function parseInnertubeBrowseCards(
       const thumbs =
         (
           cardShelf.thumbnail as {
-            musicThumbnailRenderer?: { thumbnail?: { thumbnails?: Array<{ url: string }> } };
+            musicThumbnailRenderer?: { thumbnail?: { thumbnails?: Array<{ url: string; width?: number; height?: number }> } };
           }
         )?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
-      const rawThumb = thumbs[thumbs.length - 1]?.url || thumbs[0]?.url || '';
+      const rawThumb = pickBestThumbnailUrl(thumbs);
       const thumbnailUrl = rawThumb ? `/api/proxy-image?url=${encodeURIComponent(rawThumb)}` : '';
       const nav = titleRuns[0]?.navigationEndpoint as
         | { browseEndpoint?: { browseId?: string }; watchEndpoint?: { videoId?: string } }

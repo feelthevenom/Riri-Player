@@ -26,7 +26,28 @@ export class AsyncTtlCache<T> {
   private readonly generations = new Map<string, number>();
   private readonly revisions = new Map<string, number>();
 
-  constructor(private readonly now: () => number = () => Date.now()) {}
+  constructor(
+    private readonly now: () => number = () => Date.now(),
+    private readonly maxEntries = 256,
+  ) {}
+
+  private pruneIfNeeded(now: number): void {
+    if (this.values.size < this.maxEntries) return;
+    for (const [k, entry] of this.values) {
+      if (entry.expiresAt <= now) {
+        this.values.delete(k);
+        this.generations.delete(k);
+        this.revisions.delete(k);
+      }
+    }
+    while (this.values.size >= this.maxEntries) {
+      const oldestKey = this.values.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.values.delete(oldestKey);
+      this.generations.delete(oldestKey);
+      this.revisions.delete(oldestKey);
+    }
+  }
 
   get size(): number {
     return this.values.size;
@@ -57,8 +78,10 @@ export class AsyncTtlCache<T> {
       this.generations.set(key, currentGeneration + 1);
     }
     this.revisions.set(key, (this.revisions.get(key) || 0) + 1);
+    const now = this.now();
+    this.pruneIfNeeded(now);
     this.values.set(key, {
-      expiresAt: this.now() + ttl,
+      expiresAt: now + ttl,
       value,
     });
     return true;
@@ -99,8 +122,10 @@ export class AsyncTtlCache<T> {
         (this.revisions.get(key) || 0) === revision
       ) {
         const ttl = typeof ttlMs === 'function' ? ttlMs(value) : ttlMs;
+        const writeNow = this.now();
+        this.pruneIfNeeded(writeNow);
         this.values.set(key, {
-          expiresAt: this.now() + ttl,
+          expiresAt: writeNow + ttl,
           value,
         });
       }

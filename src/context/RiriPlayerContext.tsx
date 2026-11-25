@@ -58,7 +58,9 @@ import { lyricsService } from '../utils/lyricsService';
 import { hasNonLatinScript } from '../utils/transliterate';
 import {
   appendUniqueQueueSuggestions,
+  PlayQueueModeOptions,
   replaceUpcomingQueueWithRadio,
+  shouldUseUnlimitedQueue,
 } from '../utils/queueHelpers';
 import { isSpotifyAutoSyncDue } from '../utils/spotifySyncHelpers';
 import {
@@ -352,7 +354,7 @@ interface RiriPlayerContextValue {
     query: string,
   ) => Promise<{ queries: string[]; items: YtMusicBrowseItem[] }>;
 
-  playTrack: (track: Track, newQueue?: Track[]) => Promise<void>;
+  playTrack: (track: Track, newQueue?: Track[], options?: PlayQueueModeOptions) => Promise<void>;
   playNext: (track: Track) => void;
   togglePlayPause: () => Promise<void>;
   nextTrack: () => Promise<void>;
@@ -583,6 +585,7 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const [queueNextResult, setQueueNextResult] = useState<YtMusicNextResult | null>(null);
   const [queueNextLoading, setQueueNextLoading] = useState(false);
   const queueNextRequestIdRef = useRef(0);
+  const queueUnlimitedRef = useRef(true);
   const fetchQueueNextRef = useRef<typeof fetchQueueNext | null>(null);
   const loadMoreQueueNextRef = useRef<typeof loadMoreQueueNext | null>(null);
   const syncYtMusicLibraryRef = useRef<typeof syncYtMusicLibrary | null>(null);
@@ -1541,17 +1544,26 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         if ((ytAuthStatusRef.current?.activeAccountId || null) !== requestAccountId) {
           return;
         }
-        setBrowsedCollections((prev) => ({
-          ...prev,
-          [cleanId]: {
-            title: data.title || titleHint,
-            subtitle: data.subtitle || `${(data.tracks || []).length} track(s)`,
-            thumbnailUrl: data.thumbnailUrl || '',
-            tracks: data.tracks || [],
-            cards: data.items || [],
-            loading: false,
-          },
-        }));
+        setBrowsedCollections((prev) => {
+          const next = {
+            ...prev,
+            [cleanId]: {
+              title: data.title || titleHint,
+              subtitle: data.subtitle || `${(data.tracks || []).length} track(s)`,
+              thumbnailUrl: data.thumbnailUrl || '',
+              tracks: data.tracks || [],
+              cards: data.items || [],
+              loading: false,
+            },
+          };
+          const keys = Object.keys(next);
+          if (keys.length > 12) {
+            for (const oldKey of keys.slice(0, keys.length - 12)) {
+              if (oldKey !== cleanId) delete next[oldKey];
+            }
+          }
+          return next;
+        });
       } catch {
         if ((ytAuthStatusRef.current?.activeAccountId || null) !== requestAccountId) {
           return;
@@ -2024,7 +2036,7 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   }, [fetchQueueNext]);
 
   const loadMoreQueueNext = useCallback(async (): Promise<Track[]> => {
-    if (queueNextLoading) return [];
+    if (queueNextLoading || !queueUnlimitedRef.current) return [];
     const currentCont = queueNextResult?.continuation;
 
     if (!currentCont) {
@@ -2105,7 +2117,7 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   );
 
 const playTrack = useCallback(
-    async (track: Track, newQueue?: Track[]) => {
+    async (track: Track, newQueue?: Track[], options?: PlayQueueModeOptions) => {
       let resolvedTrack = track;
       if (track.source === 'plugin' && !track.streamUrl && track.pluginId) {
         const plugin = plugins.find((p) => p.id === track.pluginId);
@@ -2145,6 +2157,18 @@ const playTrack = useCallback(
       }
 
       ensureTrackInStore(resolvedTrack);
+
+      const hasExplicitQueue = Boolean(newQueue && newQueue.length > 0);
+      const isUnlimitedQueue = shouldUseUnlimitedQueue(
+        hasExplicitQueue,
+        options,
+        queueUnlimitedRef.current,
+      );
+      queueUnlimitedRef.current = isUnlimitedQueue;
+      if (!isUnlimitedQueue) {
+        queueNextRequestIdRef.current += 1;
+        setQueueNextResult(null);
+      }
 
       let activeIdx = 0;
       let resolvedQueueSnapshot: Track[] = [resolvedTrack];
@@ -2203,8 +2227,8 @@ const playTrack = useCallback(
       if (started) {
         logPlayEvent(resolvedTrack);
 
-        // Fetch YouTube Music "Up Next" queue for YT Music tracks
-        if (resolvedTrack.source === 'ytmusic' && resolvedTrack.ytMusicVideoId) {
+        // Fetch YouTube Music "Up Next" queue only for non-playlist/non-library (unlimited) playback
+        if (isUnlimitedQueue && resolvedTrack.source === 'ytmusic' && resolvedTrack.ytMusicVideoId) {
           void fetchQueueNextRef.current?.(
             resolvedTrack.ytMusicVideoId,
             undefined,
@@ -2234,9 +2258,9 @@ const playTrack = useCallback(
     ],
   );
 
-  // Auto-prefetch next radio page when user reaches within 3 tracks of queue end
+  // Auto-prefetch next radio page when user reaches within 3 tracks of queue end (unlimited mode only)
   useEffect(() => {
-    if (!currentTrack || queue.length === 0) return;
+    if (!currentTrack || queue.length === 0 || !queueUnlimitedRef.current) return;
     if (queueIndex >= Math.max(0, queue.length - 3) && queueNextResult?.continuation && !queueNextLoading) {
       void loadMoreQueueNextRef.current?.();
     }
@@ -2261,7 +2285,7 @@ const playTrack = useCallback(
     } else if (nextIdx >= activeQueue.length) {
       if (repeatMode === 'ALL') {
         nextIdx = 0;
-      } else {
+      } else if (queueUnlimitedRef.current) {
         const more = await loadMoreQueueNextRef.current?.();
         if (more && more.length > 0) {
           const refreshedQueue = queueRef.current;
@@ -2272,6 +2296,9 @@ const playTrack = useCallback(
             return;
           }
         }
+        setIsPlaying(false);
+        return;
+      } else {
         setIsPlaying(false);
         return;
       }
@@ -3186,29 +3213,28 @@ const playTrack = useCallback(
       if (spotifySyncing) return { ok: false, message: 'Spotify sync is already in progress.' };
       setSpotifySyncing(true);
       
-      // Initialize progress
       setSpotifySyncProgress({
         phase: 'fetching',
-        message: 'Connecting to Spotify...',
+        message: 'Fetching liked songs and playlists from Spotify...',
         completed: 0,
-        total: 0,
+        total: 100,
         inProgress: true,
       });
 
-      try {
-        // Update progress: fetching liked songs
-        setSpotifySyncProgress({
-          phase: 'fetching',
-          message: 'Fetching liked songs from Spotify...',
-          completed: 0,
-          total: 100,
-          inProgress: true,
+      const progressPoller = window.setInterval(() => {
+        void ytmClient.getSpotifySyncProgress().then((p) => {
+          if (p && p.inProgress) {
+            setSpotifySyncProgress(p);
+          }
         });
+      }, 350);
 
+      try {
         const data = await ytmClient.syncSpotify(
           settings.contentRegion || 'US',
           settings.contentLanguage || 'en',
         );
+        window.clearInterval(progressPoller);
         
         if (data.connection) {
           setSpotifyConnection(data.connection);
@@ -3367,6 +3393,7 @@ const playTrack = useCallback(
         if (!silent) showToast(summary);
         return { ok: true, message: summary };
       } catch {
+        window.clearInterval(progressPoller);
         const errMsg = 'Network error while syncing Spotify library.';
         setSpotifySyncProgress({
           phase: 'error',
@@ -3378,6 +3405,7 @@ const playTrack = useCallback(
         if (!silent) showToast(errMsg, 'error');
         return { ok: false, message: errMsg };
       } finally {
+        window.clearInterval(progressPoller);
         setSpotifySyncing(false);
         // Clear progress after a delay
         setTimeout(() => {

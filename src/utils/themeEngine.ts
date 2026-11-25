@@ -47,7 +47,7 @@ export function applyMaterialTheme(
   seedHex: string,
   darkMode: DarkModePreference,
   pureBlack: boolean,
-  surfaceStyle: ThemeSurfaceStyle = 'MATERIAL',
+  surfaceStyle: ThemeSurfaceStyle = 'GLASS',
 ) {
   const prefersDark =
     darkMode === 'DARK' ||

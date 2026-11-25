@@ -13,6 +13,7 @@ import {
   parseInnertubeSearchItems,
   parseInnertubeSearchSuggestions,
   parseInnertubeRichSearchSuggestions,
+  pickBestThumbnailUrl,
 } from '../../src/utils/ytMusicParser';
 import { extractYtMusicContinuation } from '../../src/utils/ytmContinuation';
 import { getActiveYtAccount } from './credentials';
@@ -250,10 +251,10 @@ function getCollectionHeaderThumbnail(header: Record<string, unknown> | undefine
     thumbnail;
   if (!renderer) return '';
   const thumbs =
-    (renderer.thumbnail as { thumbnails?: Array<{ url?: string }> } | undefined)?.thumbnails ||
-    (renderer.thumbnails as Array<{ url?: string }> | undefined) ||
+    (renderer.thumbnail as { thumbnails?: Array<{ url?: string; width?: number; height?: number }> } | undefined)?.thumbnails ||
+    (renderer.thumbnails as Array<{ url?: string; width?: number; height?: number }> | undefined) ||
     [];
-  const rawThumb = thumbs[thumbs.length - 1]?.url || thumbs[0]?.url || '';
+  const rawThumb = pickBestThumbnailUrl(thumbs);
   return rawThumb ? `/api/proxy-image?url=${encodeURIComponent(rawThumb)}` : '';
 }
 

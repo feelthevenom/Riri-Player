@@ -34,6 +34,7 @@ import {
   configureSpotifyBearerCaptureFallback,
   createElectronSpotifyBearerCapturer,
   getSpotifyStatus,
+  getSpotifySyncProgress,
   loginSpotifyWindow,
   logoutSpotifyAccount,
   resolveManualSpotifyTrackList,
@@ -382,6 +383,10 @@ export function registerYtmIpcHandlers(params: RegisterYtmIpcParams): void {
       return await syncSpotifyLibraryToYtm(payload || {});
     },
   );
+
+  ipcMain.handle('spotify:sync-progress', () => {
+    return getSpotifySyncProgress();
+  });
 
   ipcMain.handle(
     'spotify:import-playlist',

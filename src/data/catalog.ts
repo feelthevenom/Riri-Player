@@ -322,10 +322,10 @@ export const YTM_LANGUAGES: Array<{ code: string; name: string }> = [
 export const DEFAULT_SETTINGS: AppSettings = {
   darkMode: 'DARK',
   pureBlack: false,
-  themeSurfaceStyle: 'MATERIAL',
+  themeSurfaceStyle: 'GLASS',
   dynamicThemeFromArtwork: true,
   themeColor: DEFAULT_THEME_COLOR,
-  playerBackgroundStyle: 'GRADIENT',
+  playerBackgroundStyle: 'BLUR',
   sliderStyle: 'WAVY',
   playbackSpeed: 1.0,
   preservePitch: true,

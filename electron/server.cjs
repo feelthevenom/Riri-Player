@@ -24729,6 +24729,40 @@ function parseInnertubeNext(json) {
   }
   return null;
 }
+function upgradeThumbnailUrl(rawUrl) {
+  if (!rawUrl) return rawUrl;
+  let upgraded = rawUrl.trim();
+  if (/^https?:\/\/(lh3\.googleusercontent\.com|yt3\.ggpht\.com|yt3\.googleusercontent\.com)\//i.test(upgraded)) {
+    if (/=w\d+-h\d+/i.test(upgraded)) {
+      upgraded = upgraded.replace(/=w\d+-h\d+([^?\s]*)/i, (_m, rest) => {
+        const updatedRest = String(rest || "").replace(/-l\d+/i, "-l100");
+        return `=w1200-h1200${updatedRest}`;
+      });
+    } else if (/=s\d+/i.test(upgraded)) {
+      upgraded = upgraded.replace(/=s\d+/i, "=s1200");
+    }
+  } else if (/^https?:\/\/i\d*\.ytimg\.com\/vi(?:_webp)?\/[^/]+\/(?:default|mqdefault|hqdefault|sddefault)\.(jpg|webp)/i.test(upgraded)) {
+    upgraded = upgraded.replace(
+      /\/(default|mqdefault|hqdefault|sddefault)\.(jpg|webp)/i,
+      "/maxresdefault.$2"
+    );
+  }
+  return upgraded;
+}
+function pickBestThumbnailUrl(thumbs) {
+  if (!Array.isArray(thumbs) || thumbs.length === 0) return "";
+  let best = thumbs[thumbs.length - 1];
+  let bestArea = (best?.width || 0) * (best?.height || 0);
+  for (const t of thumbs) {
+    const area = (t?.width || 0) * (t?.height || 0);
+    if (t?.url && area > bestArea) {
+      best = t;
+      bestArea = area;
+    }
+  }
+  const raw = String(best?.url || thumbs[0]?.url || "");
+  return raw ? upgradeThumbnailUrl(raw) : "";
+}
 function parsePlaylistPanelVideoRenderer(renderer) {
   const videoId = renderer.videoId || "";
   if (!videoId) return null;
@@ -24768,8 +24802,8 @@ function parsePlaylistPanelVideoRenderer(renderer) {
   const lengthText = (lengthRuns ? lengthRuns.map((r) => String(r.text || "")).join("").trim() : "") || String(renderer.lengthText?.simpleText || "") || "3:00";
   const durationSec = parseDurationTextToSec(lengthText);
   const thumbnail = renderer.thumbnail?.thumbnails || [];
-  const rawThumb = thumbnail.length > 0 ? String(thumbnail[thumbnail.length - 1].url || thumbnail[0].url || "") : "";
-  const thumbSource = rawThumb || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+  const rawThumb = pickBestThumbnailUrl(thumbnail);
+  const thumbSource = rawThumb || `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`;
   const thumbnailUrl = `/api/proxy-image?url=${encodeURIComponent(thumbSource)}`;
   const streamParams = new URLSearchParams({
     videoId,
@@ -24872,7 +24906,7 @@ function normalizeTrackFromListItem(r) {
     durationSec = parseDurationTextToSec(fixedDur);
   }
   const thumbs = r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || rAny.thumbnail?.thumbnails || [];
-  const bestThumb = thumbs[thumbs.length - 1]?.url || thumbs[0]?.url || "";
+  const bestThumb = pickBestThumbnailUrl(thumbs);
   const proxiedArt = bestThumb ? `/api/proxy-image?url=${encodeURIComponent(bestThumb)}` : "";
   if (rAny.lengthSeconds && !isNaN(parseInt(rAny.lengthSeconds, 10))) {
     durationSec = parseInt(rAny.lengthSeconds, 10);
@@ -24941,7 +24975,7 @@ function normalizeTwoRowCard(item, fallbackKind = "playlist") {
   if (!title) return null;
   const subtitle = (item.subtitle?.runs || []).map((r) => r.text || "").join("").replace(/\s+/g, " ").trim();
   const thumbs = item.thumbnailRenderer?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
-  const rawThumb = thumbs[thumbs.length - 1]?.url || thumbs[0]?.url || "";
+  const rawThumb = pickBestThumbnailUrl(thumbs);
   const thumbnailUrl = rawThumb ? `/api/proxy-image?url=${encodeURIComponent(rawThumb)}` : "";
   const browseId = item.navigationEndpoint?.browseEndpoint?.browseId;
   const params = item.navigationEndpoint?.browseEndpoint?.params;
@@ -25018,7 +25052,7 @@ function normalizeBrowseCardFromListItem(r, fallbackKind = "playlist") {
   if (!title) return null;
   const subtitle = [...flex1, ...flex2].map((x2) => x2.text || "").join("").replace(/\s+/g, " ").trim();
   const thumbs = r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || rAny.thumbnail?.thumbnails || [];
-  const rawThumb = thumbs[thumbs.length - 1]?.url || thumbs[0]?.url || "";
+  const rawThumb = pickBestThumbnailUrl(thumbs);
   const thumbnailUrl = rawThumb ? `/api/proxy-image?url=${encodeURIComponent(rawThumb)}` : "";
   const rootNav = r.navigationEndpoint || rAny.navigationEndpoint;
   const flex0Nav = flex0[0]?.navigationEndpoint;
@@ -25071,7 +25105,7 @@ function parseInnertubeBrowseCards(json, fallbackKind = "playlist") {
       const subtitleRuns = cardShelf.subtitle?.runs || [];
       const subtitle = subtitleRuns.map((r) => r.text || "").join("").replace(/\s+/g, " ").trim();
       const thumbs = cardShelf.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
-      const rawThumb = thumbs[thumbs.length - 1]?.url || thumbs[0]?.url || "";
+      const rawThumb = pickBestThumbnailUrl(thumbs);
       const thumbnailUrl = rawThumb ? `/api/proxy-image?url=${encodeURIComponent(rawThumb)}` : "";
       const nav = titleRuns[0]?.navigationEndpoint;
       const rawBrowseId = nav?.browseEndpoint?.browseId;
@@ -65936,7 +65970,7 @@ function getCollectionHeaderThumbnail(header) {
   const renderer = thumbnail?.croppedSquareThumbnailRenderer || thumbnail?.musicThumbnailRenderer || thumbnail;
   if (!renderer) return "";
   const thumbs = renderer.thumbnail?.thumbnails || renderer.thumbnails || [];
-  const rawThumb = thumbs[thumbs.length - 1]?.url || thumbs[0]?.url || "";
+  const rawThumb = pickBestThumbnailUrl(thumbs);
   return rawThumb ? `/api/proxy-image?url=${encodeURIComponent(rawThumb)}` : "";
 }
 function parseYtmCollectionResponse(json, browseId) {
@@ -66555,14 +66589,33 @@ async function setYtmLikeStatus(opts) {
 
 // src/utils/asyncTtlCache.ts
 var AsyncTtlCache = class {
-  constructor(now = () => Date.now()) {
+  constructor(now = () => Date.now(), maxEntries = 256) {
     this.now = now;
+    this.maxEntries = maxEntries;
   }
   now;
+  maxEntries;
   values = /* @__PURE__ */ new Map();
   requests = /* @__PURE__ */ new Map();
   generations = /* @__PURE__ */ new Map();
   revisions = /* @__PURE__ */ new Map();
+  pruneIfNeeded(now) {
+    if (this.values.size < this.maxEntries) return;
+    for (const [k, entry] of this.values) {
+      if (entry.expiresAt <= now) {
+        this.values.delete(k);
+        this.generations.delete(k);
+        this.revisions.delete(k);
+      }
+    }
+    while (this.values.size >= this.maxEntries) {
+      const oldestKey = this.values.keys().next().value;
+      if (oldestKey === void 0) break;
+      this.values.delete(oldestKey);
+      this.generations.delete(oldestKey);
+      this.revisions.delete(oldestKey);
+    }
+  }
   get size() {
     return this.values.size;
   }
@@ -66582,8 +66635,10 @@ var AsyncTtlCache = class {
       this.generations.set(key, currentGeneration + 1);
     }
     this.revisions.set(key, (this.revisions.get(key) || 0) + 1);
+    const now = this.now();
+    this.pruneIfNeeded(now);
     this.values.set(key, {
-      expiresAt: this.now() + ttl,
+      expiresAt: now + ttl,
       value
     });
     return true;
@@ -66612,8 +66667,10 @@ var AsyncTtlCache = class {
       const value = await request.promise;
       if (this.generations.get(key) === generation && (this.revisions.get(key) || 0) === revision) {
         const ttl = typeof ttlMs === "function" ? ttlMs(value) : ttlMs;
+        const writeNow = this.now();
+        this.pruneIfNeeded(writeNow);
         this.values.set(key, {
-          expiresAt: this.now() + ttl,
+          expiresAt: writeNow + ttl,
           value
         });
       }
@@ -67941,9 +67998,14 @@ async function mapSpotifyTrackToYtm(spTrack, gl, hl) {
     }
   };
 }
+var currentSpotifySyncProgress = null;
+function getSpotifySyncProgress() {
+  return currentSpotifySyncProgress ? { ...currentSpotifySyncProgress } : null;
+}
 async function syncSpotifyLibraryToYtm(opts) {
   const creds = await getSpotifyCredentials();
   if (!creds?.spDc) {
+    currentSpotifySyncProgress = null;
     return {
       ok: false,
       connection: null,
@@ -67957,17 +68019,47 @@ async function syncSpotifyLibraryToYtm(opts) {
   }
   const gl = opts.gl || "US";
   const hl = opts.hl || "en";
+  currentSpotifySyncProgress = {
+    phase: "fetching",
+    message: "Fetching liked songs and playlists from Spotify...",
+    completed: 0,
+    total: 100,
+    inProgress: true
+  };
   try {
     const [rawLiked, rawPlaylists, albumsArtists] = await Promise.all([
       fetchLikedSpotifyTracks(40),
       fetchUserSpotifyPlaylists(),
       fetchSavedAlbumsAndArtists()
     ]);
+    const likedSlice = rawLiked.slice(0, 30);
+    const playlistSlice = rawPlaylists.slice(0, 12);
+    const totalWork = Math.max(
+      1,
+      likedSlice.length + playlistSlice.reduce((sum, pl) => sum + Math.min(35, pl.tracks.length), 0)
+    );
+    let completedWork = 0;
+    currentSpotifySyncProgress = {
+      phase: "matching",
+      message: `Matching ${likedSlice.length} liked songs on YouTube Music...`,
+      completed: 0,
+      total: totalWork,
+      inProgress: true
+    };
     const unmatchedTracks = [];
     const likedTracks = [];
     const seenVideoIds = /* @__PURE__ */ new Set();
-    for (const spTrack of rawLiked.slice(0, 30)) {
+    for (const spTrack of likedSlice) {
+      currentSpotifySyncProgress = {
+        phase: "matching",
+        message: "Matching liked songs on YouTube Music...",
+        completed: completedWork,
+        total: totalWork,
+        currentItem: `${spTrack.artist} - ${spTrack.name}`,
+        inProgress: true
+      };
       const mapped = await mapSpotifyTrackToYtm(spTrack, gl, hl);
+      completedWork += 1;
       if (mapped.matched) {
         if (!seenVideoIds.has(mapped.matched.ytMusicVideoId || mapped.matched.id)) {
           seenVideoIds.add(mapped.matched.ytMusicVideoId || mapped.matched.id);
@@ -67978,10 +68070,19 @@ async function syncSpotifyLibraryToYtm(opts) {
       }
     }
     const playlists = [];
-    for (const pl of rawPlaylists.slice(0, 12)) {
+    for (const pl of playlistSlice) {
       const matchedPlTracks = [];
       for (const spTrack of pl.tracks.slice(0, 35)) {
+        currentSpotifySyncProgress = {
+          phase: "importing",
+          message: `Matching playlist: ${pl.name}`,
+          completed: completedWork,
+          total: totalWork,
+          currentItem: `${spTrack.artist} - ${spTrack.name}`,
+          inProgress: true
+        };
         const mapped = await mapSpotifyTrackToYtm(spTrack, gl, hl);
+        completedWork += 1;
         if (mapped.matched) {
           matchedPlTracks.push(mapped.matched);
         } else if (mapped.unmatched) {
@@ -68002,6 +68103,13 @@ async function syncSpotifyLibraryToYtm(opts) {
       unmatchedTracks,
       lastError: void 0
     });
+    currentSpotifySyncProgress = {
+      phase: "complete",
+      message: `Matched ${totalMatched} tracks across ${playlists.length} playlists`,
+      completed: totalWork,
+      total: totalWork,
+      inProgress: false
+    };
     return {
       ok: true,
       connection,
@@ -68013,6 +68121,13 @@ async function syncSpotifyLibraryToYtm(opts) {
     };
   } catch (err2) {
     const msg = err2 instanceof Error ? err2.message : "Spotify sync failed.";
+    currentSpotifySyncProgress = {
+      phase: "error",
+      message: msg,
+      completed: 0,
+      total: 0,
+      inProgress: false
+    };
     const connection = await updateSpotifyCredentials({ lastError: msg });
     return {
       ok: false,
@@ -68960,28 +69075,60 @@ async function startAppServer(opts = {}) {
       res.status(400).end();
       return;
     }
+    const originalStr = parsed.toString();
+    const candidateUrls = [];
+    if (/^https?:\/\/(lh3\.googleusercontent\.com|yt3\.ggpht\.com|yt3\.googleusercontent\.com)\//i.test(originalStr)) {
+      let upgraded = originalStr;
+      if (/=w\d+-h\d+/i.test(upgraded)) {
+        upgraded = upgraded.replace(/=w\d+-h\d+([^?\s]*)/i, (_m, rest) => {
+          const updatedRest = String(rest || "").replace(/-l\d+/i, "-l100");
+          return `=w1200-h1200${updatedRest}`;
+        });
+      } else if (/=s\d+/i.test(upgraded)) {
+        upgraded = upgraded.replace(/=s\d+/i, "=s1200");
+      }
+      candidateUrls.push(upgraded);
+      if (upgraded !== originalStr) candidateUrls.push(originalStr);
+    } else if (/^https?:\/\/i\d*\.ytimg\.com\/vi(?:_webp)?\/[^/]+\/(?:default|mqdefault|hqdefault|sddefault|maxresdefault)\.(jpg|webp)/i.test(originalStr)) {
+      candidateUrls.push(
+        originalStr.replace(/\/(default|mqdefault|hqdefault|sddefault|maxresdefault)\.(jpg|webp)/i, "/maxresdefault.$2"),
+        originalStr.replace(/\/(default|mqdefault|hqdefault|sddefault|maxresdefault)\.(jpg|webp)/i, "/sddefault.$2"),
+        originalStr.replace(/\/(default|mqdefault|hqdefault|sddefault|maxresdefault)\.(jpg|webp)/i, "/hqdefault.$2")
+      );
+      if (!candidateUrls.includes(originalStr)) candidateUrls.push(originalStr);
+    } else {
+      candidateUrls.push(originalStr);
+    }
+    const headers = {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+      Referer: "https://music.youtube.com/"
+    };
     try {
-      const upstream = await fetch(parsed.toString(), {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-          Referer: "https://music.youtube.com/"
-        },
-        signal: AbortSignal.timeout(1e4)
-      });
-      if (!upstream.ok) {
-        res.status(upstream.status).end();
+      let lastStatus = 502;
+      for (const targetUrl of candidateUrls) {
+        const safeTarget = parseSafeExternalUrl(targetUrl);
+        if (!safeTarget) continue;
+        const upstream = await fetch(safeTarget.toString(), {
+          headers,
+          signal: AbortSignal.timeout(1e4)
+        });
+        if (!upstream.ok) {
+          lastStatus = upstream.status;
+          continue;
+        }
+        const ctype = upstream.headers.get("content-type") || "image/jpeg";
+        if (!ctype.startsWith("image/")) {
+          lastStatus = 415;
+          continue;
+        }
+        res.setHeader("Content-Type", ctype);
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Cache-Control", "public, max-age=86400");
+        const buf = Buffer.from(await upstream.arrayBuffer());
+        res.send(buf);
         return;
       }
-      const ctype = upstream.headers.get("content-type") || "image/jpeg";
-      if (!ctype.startsWith("image/")) {
-        res.status(415).end();
-        return;
-      }
-      res.setHeader("Content-Type", ctype);
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      res.setHeader("Cache-Control", "public, max-age=86400");
-      const buf = Buffer.from(await upstream.arrayBuffer());
-      res.send(buf);
+      res.status(lastStatus).end();
     } catch {
       res.status(502).end();
     }
@@ -69180,6 +69327,9 @@ async function startAppServer(opts = {}) {
       hl: req.body?.hl || "en"
     });
     res.status(out.ok ? 200 : 400).json(out);
+  });
+  app.get("/api/spotify/sync-progress", (_req, res) => {
+    res.json({ ok: true, progress: getSpotifySyncProgress() });
   });
   app.post("/api/spotify/import-playlist", async (req, res) => {
     const out = await resolveManualSpotifyTrackList({
