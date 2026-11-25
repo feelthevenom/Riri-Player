@@ -1,7 +1,8 @@
 import React, { useEffect, useMemo, useRef } from 'react';
-import { ListMusic, Mic2, Minus, Plus, X } from 'lucide-react';
+import { Languages, ListMusic, Mic2, Minus, Plus, X } from 'lucide-react';
 import { useRiriPlayer } from '../context/RiriPlayerContext';
 import { findActiveLyricIndex, parseLrcLyrics } from '../utils/lyricsParser';
+import { hasNonLatinScript } from '../utils/transliterate';
 import { UpNextQueueView } from './UpNextQueueView';
 
 export const RightContextPanel: React.FC = () => {
@@ -23,6 +24,12 @@ export const RightContextPanel: React.FC = () => {
   const parsedLyrics = useMemo(
     () => parseLrcLyrics(activeTrackLyrics.syncedLyrics),
     [activeTrackLyrics.syncedLyrics],
+  );
+
+  const hasAlternateLanguage = Boolean(
+    activeTrackLyrics.hasAlternateLanguage ||
+    (activeTrackLyrics.englishLyrics && activeTrackLyrics.englishLyrics.length > 0) ||
+    hasNonLatinScript(activeTrackLyrics.syncedLyrics || activeTrackLyrics.plainLyrics || '')
   );
 
   const activeLineIdx = useMemo(
@@ -61,17 +68,28 @@ export const RightContextPanel: React.FC = () => {
             <Mic2 className="w-3.5 h-3.5" />
             Lyrics
           </button>
-          {activeTrackLyrics.syncedLyrics && activeTrackLyrics.englishLyrics && (
+          {hasAlternateLanguage && (
             <button
               type="button"
-              onClick={() => toggleLyricsLanguage()}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+              onClick={() => void toggleLyricsLanguage()}
+              aria-label={
                 settings.lyricsLanguage === 'ENGLISH'
-                  ? 'bg-[var(--md-primary)] text-[var(--md-on-primary)]'
+                  ? 'Switch to Native lyrics'
+                  : 'Switch to English lyrics'
+              }
+              title={
+                settings.lyricsLanguage === 'ENGLISH'
+                  ? 'Showing English transliteration. Click for Native.'
+                  : 'Showing Native script. Click for English.'
+              }
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+                settings.lyricsLanguage === 'ENGLISH'
+                  ? 'bg-[var(--md-primary)] text-[var(--md-on-primary)] shadow-sm'
                   : 'text-[var(--md-on-surface-variant)] hover:text-[var(--md-on-surface)]'
               }`}
             >
-              {settings.lyricsLanguage === 'ENGLISH' ? 'Native' : 'English'}
+              <Languages className="w-3.5 h-3.5" />
+              <span>{settings.lyricsLanguage === 'ENGLISH' ? 'English' : 'Native'}</span>
             </button>
           )}
           <button
@@ -186,7 +204,11 @@ export const RightContextPanel: React.FC = () => {
                   Plain Lyrics (Unsynced)
                 </div>
                 <pre className="whitespace-pre-wrap font-lyrics text-sm leading-relaxed text-[var(--md-on-surface)]/90">
-                  {activeTrackLyrics.plainLyrics}
+                  {settings.lyricsLanguage === 'ENGLISH' &&
+                  activeTrackLyrics.englishLyrics &&
+                  activeTrackLyrics.englishLyrics.length > 0
+                    ? activeTrackLyrics.englishLyrics.join('\n')
+                    : activeTrackLyrics.plainLyrics}
                 </pre>
               </div>
             ) : (

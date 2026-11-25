@@ -12,6 +12,24 @@ import type {
 } from '../types/music';
 import { audioEngine } from './audioEngine';
 
+export interface YtmAuthErrorPayload {
+  ok: false;
+  error: string;
+  code?: string;
+  retryable?: boolean;
+}
+
+export type YtmAuthStatusResult = YtAuthStatusPayload | YtmAuthErrorPayload;
+
+function isYtmAuthErrorPayload(value: unknown): value is YtmAuthErrorPayload {
+  return Boolean(
+    value &&
+      typeof value === 'object' &&
+      (value as { ok?: unknown }).ok === false &&
+      typeof (value as { error?: unknown }).error === 'string',
+  );
+}
+
 export interface ElectronYtmBridge {
   setMinimizeToTray?: (enabled: boolean) => void;
   setFullscreen?: (fullscreen: boolean) => void;
@@ -26,12 +44,22 @@ export interface ElectronYtmBridge {
     ytmStatus: () => Promise<YtAuthStatusPayload>;
     ytmVaultDiagnostic: () => Promise<{ error?: string; unreadableFile?: boolean } | null>;
     ytmInvalidateVaultCache: () => Promise<{ ok: boolean }>;
+    ytmResetVault: () => Promise<
+      | { ok: true; backupPath?: string | null }
+      | YtmAuthErrorPayload
+    >;
+    ytmReset: () => Promise<
+      | { ok: true; status?: YtAuthStatusPayload }
+      | YtmAuthErrorPayload
+    >;
     ytmLogin: (options?: { cleanPartition?: boolean }) => Promise<{
       ok: boolean;
       status?: YtAuthStatusPayload;
       blocked?: boolean;
       cancelled?: boolean;
       error?: string;
+      retryable?: boolean;
+      warning?: string;
     }>;
     ytmCancel: () => Promise<{ ok: boolean }>;
     ytmImportBrowser: (payload: {
@@ -39,9 +67,12 @@ export interface ElectronYtmBridge {
       visitorData?: string;
       dataSyncId?: string;
       accountIndex?: number;
-    }) => Promise<{ ok: boolean; status?: YtAuthStatusPayload; error?: string }>;
-    ytmSwitch: (accountId: string) => Promise<YtAuthStatusPayload>;
-    ytmLogout: (accountId?: string) => Promise<YtAuthStatusPayload>;
+    }) => Promise<
+      | { ok: boolean; status?: YtAuthStatusPayload; error?: string; retryable?: boolean }
+      | YtmAuthErrorPayload
+    >;
+    ytmSwitch: (accountId: string) => Promise<YtmAuthStatusResult>;
+    ytmLogout: (accountId?: string) => Promise<YtmAuthStatusResult>;
     spotifyStatus: () => Promise<SpotifyConnection | null>;
     spotifyLogin: () => Promise<{
       ok: boolean;
@@ -54,6 +85,7 @@ export interface ElectronYtmBridge {
     sync: (payload?: { gl?: string; hl?: string }) => Promise<{
       ok: boolean;
       likedTracks: Track[];
+      libraryTracks: Track[];
       playlists: Array<{
         browseId: string;
         playlistId: string;
@@ -61,15 +93,27 @@ export interface ElectronYtmBridge {
         subtitle?: string;
         thumbnailUrl?: string;
         tracks: Track[];
+        tracksComplete: boolean;
+        tracksIncompleteReason?: string;
       }>;
       savedAlbums: YtMusicBrowseItem[];
       followedArtists: YtMusicBrowseItem[];
       uploadedTracks: Track[];
       historyTracks: Track[];
+      complete: boolean;
+      playlistsComplete: boolean;
+      incompleteReason?: string;
       syncedAt: number;
+      accountId?: string | null;
       error?: string;
     }>;
-    like: (payload: { videoId: string; liked: boolean; gl?: string; hl?: string }) => Promise<{
+    like: (payload: {
+      videoId: string;
+      liked: boolean;
+      gl?: string;
+      hl?: string;
+      expectedAccountId?: string | null;
+    }) => Promise<{
       ok: boolean;
     }>;
     onProgress: (cb: (progress: LibrarySyncProgress) => void) => () => void;
@@ -126,6 +170,7 @@ export interface ElectronYtmBridge {
     lyrics: (payload: {
       videoId: string;
       lyricsBrowseId?: string;
+      lyricsBrowseVideoId?: string;
       gl?: string;
       hl?: string;
     }) => Promise<{ plainLyrics?: string; source?: string }>;
@@ -268,7 +313,11 @@ export const ytmClient = {
     const api = getElectronBridge();
     if (api?.auth) return await api.auth.ytmStatus();
     const res = await apiFetch('/api/auth/ytm/status');
-    return (await res.json()) as YtAuthStatusPayload;
+    const data = (await res.json()) as YtAuthStatusPayload & { error?: string };
+    if (!res.ok) {
+      throw new Error(data.error || 'Failed to read YouTube Music sign-in status.');
+    }
+    return data;
   },
 
   async getYtmVaultDiagnostic(): Promise<{ error?: string; unreadableFile?: boolean } | null> {
@@ -283,6 +332,42 @@ export const ytmClient = {
     return { ok: false };
   },
 
+  async resetYtmVault(): Promise<{ ok: boolean; backupPath?: string | null; error?: string }> {
+    const api = getElectronBridge();
+    if (api?.auth) {
+      try {
+        return await api.auth.ytmResetVault();
+      } catch (err) {
+        return {
+          ok: false,
+          error: err instanceof Error ? err.message : 'Failed to reset the encrypted session vault.',
+        };
+      }
+    }
+    return {
+      ok: false,
+      error: 'Resetting the encrypted YouTube Music vault requires the desktop app.',
+    };
+  },
+
+  async resetYtmAuth(): Promise<{ ok: boolean; status?: YtAuthStatusPayload; error?: string }> {
+    const api = getElectronBridge();
+    if (api?.auth) {
+      try {
+        return await api.auth.ytmReset();
+      } catch (err) {
+        return {
+          ok: false,
+          error: err instanceof Error ? err.message : 'Failed to sign out of YouTube Music.',
+        };
+      }
+    }
+    return {
+      ok: false,
+      error: 'Signing out of YouTube Music requires the desktop app.',
+    };
+  },
+
   async loginYtm(options?: { cleanPartition?: boolean }) {
     const api = getElectronBridge();
     if (api?.auth) return await api.auth.ytmLogin(options);
@@ -291,6 +376,7 @@ export const ytmClient = {
       blocked: true,
       error:
         'YouTube Music sign-in requires running Riri Player in the desktop app (npm run dev:electron).',
+      retryable: false,
     };
   },
 
@@ -322,24 +408,52 @@ export const ytmClient = {
 
   async switchYtmAccount(accountId: string): Promise<YtAuthStatusPayload> {
     const api = getElectronBridge();
-    if (api?.auth) return await api.auth.ytmSwitch(accountId);
+    if (api?.auth) {
+      const data = await api.auth.ytmSwitch(accountId);
+      if (isYtmAuthErrorPayload(data)) {
+        throw new Error(data.error);
+      }
+      return data;
+    }
     const res = await apiFetch('/api/auth/ytm/switch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ accountId }),
     });
-    return (await res.json()) as YtAuthStatusPayload;
+    const data = (await res.json()) as YtmAuthStatusResult;
+    if (!res.ok || isYtmAuthErrorPayload(data)) {
+      throw new Error(
+        isYtmAuthErrorPayload(data)
+          ? data.error
+          : 'Could not switch YouTube Music account.',
+      );
+    }
+    return data;
   },
 
   async logoutYtmAccount(accountId?: string): Promise<YtAuthStatusPayload> {
     const api = getElectronBridge();
-    if (api?.auth) return await api.auth.ytmLogout(accountId);
+    if (api?.auth) {
+      const data = await api.auth.ytmLogout(accountId);
+      if (isYtmAuthErrorPayload(data)) {
+        throw new Error(data.error);
+      }
+      return data;
+    }
     const res = await apiFetch('/api/auth/ytm/logout', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ accountId }),
     });
-    return (await res.json()) as YtAuthStatusPayload;
+    const data = (await res.json()) as YtmAuthStatusResult;
+    if (!res.ok || isYtmAuthErrorPayload(data)) {
+      throw new Error(
+        isYtmAuthErrorPayload(data)
+          ? data.error
+          : 'Could not sign out of YouTube Music.',
+      );
+    }
+    return data;
   },
 
   async syncYtmLibrary(gl = 'US', hl = 'en') {
@@ -361,6 +475,7 @@ export const ytmClient = {
     return {
       ...raw,
       likedTracks: (raw.likedTracks || []).map(decorateTrackThumb),
+      libraryTracks: (raw.libraryTracks || []).map(decorateTrackThumb),
       playlists: (raw.playlists || []).map((pl) => ({
         ...pl,
         thumbnailUrl: pl.thumbnailUrl ? decorateProxyUrl(pl.thumbnailUrl) : undefined,
@@ -373,13 +488,21 @@ export const ytmClient = {
     };
   },
 
-  async likeYtmTrack(videoId: string, liked: boolean, gl = 'US', hl = 'en') {
+  async likeYtmTrack(
+    videoId: string,
+    liked: boolean,
+    gl = 'US',
+    hl = 'en',
+    expectedAccountId?: string | null,
+  ) {
     const api = getElectronBridge();
-    if (api?.library) return await api.library.like({ videoId, liked, gl, hl });
+    if (api?.library) {
+      return await api.library.like({ videoId, liked, gl, hl, expectedAccountId });
+    }
     const res = await apiFetch('/api/ytmusic/like', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ videoId, liked, gl, hl }),
+      body: JSON.stringify({ videoId, liked, gl, hl, expectedAccountId }),
     });
     return (await res.json()) as { ok: boolean };
   },
@@ -563,6 +686,7 @@ export const ytmClient = {
     artist: string;
     videoId?: string;
     lyricsBrowseId?: string;
+    lyricsBrowseVideoId?: string;
     gl?: string;
     hl?: string;
   }): Promise<{ syncedLyrics?: string; plainLyrics?: string; source?: string }> {
@@ -591,11 +715,30 @@ export const ytmClient = {
       return await api.queue.lyrics({
         videoId: payload.videoId,
         lyricsBrowseId: payload.lyricsBrowseId,
+        lyricsBrowseVideoId: payload.lyricsBrowseVideoId,
         gl: payload.gl,
         hl: payload.hl,
       });
     }
     return {};
+  },
+
+  async getYtmLyrics(payload: {
+    videoId?: string;
+    lyricsBrowseId?: string;
+    lyricsBrowseVideoId?: string;
+    gl?: string;
+    hl?: string;
+  }): Promise<{ plainLyrics?: string; source?: string } | null> {
+    const api = getElectronBridge();
+    if (!api?.queue?.lyrics || !payload.videoId) return null;
+    return await api.queue.lyrics({
+      videoId: payload.videoId,
+      lyricsBrowseId: payload.lyricsBrowseId,
+      lyricsBrowseVideoId: payload.lyricsBrowseVideoId,
+      gl: payload.gl,
+      hl: payload.hl,
+    });
   },
 
   async getSponsorBlock(videoId: string) {

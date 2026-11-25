@@ -60,6 +60,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ytmStatus: () => ipcRenderer.invoke('auth:ytm:status'),
     ytmVaultDiagnostic: () => ipcRenderer.invoke('auth:ytm:vault-diagnostic'),
     ytmInvalidateVaultCache: () => ipcRenderer.invoke('auth:ytm:invalidate-vault-cache'),
+    ytmResetVault: () => ipcRenderer.invoke('auth:ytm:reset-vault'),
+    ytmReset: () => ipcRenderer.invoke('auth:ytm:reset'),
     ytmLogin: (options) => ipcRenderer.invoke('auth:ytm:login', options),
     ytmCancel: () => ipcRenderer.invoke('auth:ytm:cancel'),
     ytmImportBrowser: (payload) => ipcRenderer.invoke('auth:ytm:import-browser', payload),

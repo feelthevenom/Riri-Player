@@ -188,6 +188,24 @@ export function hasYouTubeLoginCookie(cookie?: string | null): boolean {
   return hasSapisid && hasSessionId;
 }
 
+/**
+ * Returns true when any individually sensitive Google/YouTube authentication
+ * cookie remains. Logout verification must not require a complete cookie pair:
+ * a leftover SID or SAPISID is still enough to identify or resurrect a login.
+ */
+export function hasResidualYouTubeAuthCookie(cookie?: string | null): boolean {
+  if (!cookie || typeof cookie !== 'string') return false;
+  return Boolean(
+    extractSapisidFromCookie(cookie) ||
+      extractCookieValue(cookie, '__Secure-1PAPISID') ||
+      extractCookieValue(cookie, '__Secure-3PAPISID') ||
+      extractCookieValue(cookie, 'SID') ||
+      extractCookieValue(cookie, '__Secure-3PSID') ||
+      extractCookieValue(cookie, '__Secure-1PSID') ||
+      extractCookieValue(cookie, 'LOGIN_INFO'),
+  );
+}
+
 export function computeSapisidHash(cookie: string, origin = ORIGIN_YOUTUBE_MUSIC): string | null {
   const sapisid = extractSapisidFromCookie(cookie);
   if (!sapisid) return null;

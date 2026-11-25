@@ -48,14 +48,31 @@ import {
   saveLibraryStateToDb,
   saveLocalAudioBlob,
   saveQueueStateToDb,
+  waitForPendingLibraryWrites,
+  type PersistedLibraryState,
+  type PersistedQueueState,
 } from '../utils/storageDb';
 import { runArchPluginSearch, resolveArchPluginStream } from '../utils/archPluginRunner';
 import { findActiveLyricIndex, parseLrcLyrics } from '../utils/lyricsParser';
+import { lyricsService } from '../utils/lyricsService';
+import { hasNonLatinScript } from '../utils/transliterate';
 import {
   appendUniqueQueueSuggestions,
   replaceUpcomingQueueWithRadio,
 } from '../utils/queueHelpers';
 import { isSpotifyAutoSyncDue } from '../utils/spotifySyncHelpers';
+import {
+  applyLikedTrackIdsToTracks,
+  collectIndependentYtTrackIds,
+  deriveLikedTrackSets,
+  isAuthoritativeYtLibrarySnapshot,
+  isPersistedYtAccountMatch,
+  isPersistedYtQueueOwnedByAccount,
+  mergeLikedTrackIds,
+  mergeSyncedYtPlaylists,
+  scopeYtMusicTracksToAccount,
+  tagYtMusicTracksForAccount,
+} from '../utils/ytmLibraryState';
 import {
   apiFetch,
   getElectronBridge,
@@ -68,6 +85,56 @@ const SETTINGS_KEY = 'ririp_c_settings_v2';
 const EQ_STORAGE_KEY = 'ririp_c_eq_v2';
 const MINI_OVERLAY_CHANNEL = 'riri_mini_overlay';
 const YT_AUTH_LOCAL_KEY = 'ririp_c_yt_auth_v1';
+
+function isAuthoritativeYtAuthStatus(
+  value: YtAuthStatusPayload,
+): value is YtAuthStatusPayload {
+  if (
+    typeof value?.loggedIn !== 'boolean' ||
+    !Array.isArray(value.accounts) ||
+    value.accounts.some(
+      (account) =>
+        !account ||
+        typeof account.id !== 'string' ||
+        !account.id ||
+        typeof account.name !== 'string',
+    )
+  ) {
+    return false;
+  }
+  if (!value.loggedIn) return true;
+  return Boolean(
+    typeof value.activeAccountId === 'string' &&
+      value.activeAccountId &&
+      value.accounts.some((account) => account.id === value.activeAccountId),
+  );
+}
+
+function parseOptimisticYtAuthStatus(value: unknown): YtAuthStatusPayload | null {
+  if (!value || typeof value !== 'object') return null;
+  const status = value as Partial<YtAuthStatusPayload>;
+  if (
+    typeof status.loggedIn !== 'boolean' ||
+    !Array.isArray(status.accounts) ||
+    status.accounts.some(
+      (account) =>
+        !account ||
+        typeof account !== 'object' ||
+        typeof account.id !== 'string' ||
+        typeof account.name !== 'string',
+    )
+  ) {
+    return null;
+  }
+  if (
+    status.activeAccountId !== null &&
+    status.activeAccountId !== undefined &&
+    typeof status.activeAccountId !== 'string'
+  ) {
+    return null;
+  }
+  return status as YtAuthStatusPayload;
+}
 
 function redecorateTrack(t: Track): Track {
   return {
@@ -151,7 +218,14 @@ interface RiriPlayerContextValue {
 
   browsedCollections: Record<
     string,
-    { title: string; subtitle: string; tracks: Track[]; cards: YtMusicBrowseItem[]; loading?: boolean }
+    {
+      title: string;
+      subtitle: string;
+      thumbnailUrl?: string;
+      tracks: Track[];
+      cards: YtMusicBrowseItem[];
+      loading?: boolean;
+    }
   >;
   openYtMusicBrowse: (browseId: string, titleHint?: string, params?: string) => Promise<void>;
 
@@ -169,8 +243,19 @@ interface RiriPlayerContextValue {
   ytAccounts: YtAccountSummary[];
   activeYtAccount: YtAccountSummary | null;
   signingInYtMusic: boolean;
+  ytAccountMutationPending: boolean;
   ytLoginError: string | null;
+  ytLoginRetryable: boolean;
+  ytLoginBlocked: boolean;
   clearYtLoginError: () => void;
+  retryYtMusicSignIn: () => Promise<{
+    ok: boolean;
+    blocked?: boolean;
+    cancelled?: boolean;
+    retryable?: boolean;
+    message: string;
+  }>;
+  resetYtVault: () => Promise<{ ok: boolean; message: string }>;
   ytSavedAlbums: YtMusicBrowseItem[];
   ytFollowedArtists: YtMusicBrowseItem[];
   ytUploadedTracks: Track[];
@@ -179,7 +264,13 @@ interface RiriPlayerContextValue {
   lastLibrarySyncAt: number | null;
   signInWithYouTubeMusic: (options?: {
     cleanPartition?: boolean;
-  }) => Promise<{ ok: boolean; blocked?: boolean; cancelled?: boolean; message: string }>;
+  }) => Promise<{
+    ok: boolean;
+    blocked?: boolean;
+    cancelled?: boolean;
+    retryable?: boolean;
+    message: string;
+  }>;
   cancelYtMusicSignIn: () => Promise<void>;
   importYtmBrowserSession: (payload: {
     cookieHeader: string;
@@ -300,6 +391,7 @@ interface RiriPlayerContextValue {
   recordSearchQuery: (q: string) => void;
   clearSearchHistory: () => void;
   updateSettings: (patch: Partial<AppSettings>) => void;
+  effectiveThemeColor: string;
 
   selectEqProfile: (id: string) => void;
   updateEqBand: (bandIndex: number, db: number) => void;
@@ -315,6 +407,8 @@ interface RiriPlayerContextValue {
     englishLyrics: string[] | null;
     translations: string[];
     source: string | null;
+    provider?: string | null;
+    hasAlternateLanguage?: boolean;
     loading: boolean;
   };
   refreshCurrentLyrics: () => Promise<void>;
@@ -391,7 +485,14 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const [browsedCollections, setBrowsedCollections] = useState<
     Record<
       string,
-      { title: string; subtitle: string; tracks: Track[]; cards: YtMusicBrowseItem[]; loading?: boolean }
+      {
+        title: string;
+        subtitle: string;
+        thumbnailUrl?: string;
+        tracks: Track[];
+        cards: YtMusicBrowseItem[];
+        loading?: boolean;
+      }
     >
   >({});
 
@@ -399,14 +500,32 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const [proxyReady, setProxyReady] = useState(false);
   const [tracks, setTracks] = useState<Track[]>([]);
   const [playlists, setPlaylists] = useState<Playlist[]>(DEFAULT_PLAYLISTS);
+  const playlistsRef = useRef<Playlist[]>(DEFAULT_PLAYLISTS);
+  playlistsRef.current = playlists;
+  const [ytmLikedTrackIds, setYtmLikedTrackIds] = useState<string[]>([]);
+  const [localLikedTrackIds, setLocalLikedTrackIds] = useState<string[]>([]);
+  const ytmLikedTrackIdsRef = useRef(new Set<string>());
+  const localLikedTrackIdsRef = useRef(new Set<string>());
   const [tags, setTags] = useState<PlaylistTag[]>(DEFAULT_TAGS);
   const [playEvents, setPlayEvents] = useState<PlayEvent[]>([]);
   const [searchHistory, setSearchHistory] = useState<string[]>([]);
   const [plugins, setPlugins] = useState<ArchPlugin[]>([]);
 
   const [ytAuthStatus, setYtAuthStatus] = useState<YtAuthStatusPayload | null>(null);
+  const ytAuthStatusRef = useRef<YtAuthStatusPayload | null>(null);
+  const [ytAuthVerified, setYtAuthVerified] = useState(false);
+  const pendingPersistedLibraryRef = useRef<PersistedLibraryState | null>(null);
+  const pendingPersistedQueueRef = useRef<{
+    state: PersistedQueueState;
+    independentTrackIds: Set<string>;
+    libraryAccountId: string | null;
+  } | null>(null);
+  const accountEpochRef = useRef(0);
+  const accountMutationVersionRef = useRef(0);
+  const isResettingRef = useRef(false);
   const [ytVaultDiagnostic, setYtVaultDiagnostic] = useState<{ error?: string; unreadableFile?: boolean } | null>(null);
   const [signingInYtMusic, setSigningInYtMusic] = useState(false);
+  const [ytAccountMutationPending, setYtAccountMutationPending] = useState(false);
   const [ytSavedAlbums, setYtSavedAlbums] = useState<YtMusicBrowseItem[]>([]);
   const [ytFollowedArtists, setYtFollowedArtists] = useState<YtMusicBrowseItem[]>([]);
   const [ytUploadedTracks, setYtUploadedTracks] = useState<Track[]>([]);
@@ -452,15 +571,22 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   }, [currentTrack]);
 
   const [isPlaying, setIsPlaying] = useState(false);
+  const likeMutationVersionRef = useRef(new Map<string, number>());
+  const likeDesiredStateRef = useRef(new Map<string, boolean>());
   const [positionSec, setPositionSec] = useState(0);
+  const positionSecRef = useRef(0);
+  positionSecRef.current = positionSec;
+  const miniOverlayPublisherRef = useRef<BroadcastChannel | null>(null);
   const [durationSec, setDurationSec] = useState(0);
   const [repeatMode, setRepeatMode] = useState<RepeatMode>('OFF');
   const [shuffleEnabled, setShuffleEnabled] = useState(false);
   const [queueNextResult, setQueueNextResult] = useState<YtMusicNextResult | null>(null);
   const [queueNextLoading, setQueueNextLoading] = useState(false);
+  const queueNextRequestIdRef = useRef(0);
   const fetchQueueNextRef = useRef<typeof fetchQueueNext | null>(null);
   const loadMoreQueueNextRef = useRef<typeof loadMoreQueueNext | null>(null);
   const syncYtMusicLibraryRef = useRef<typeof syncYtMusicLibrary | null>(null);
+  const librarySyncRequestIdRef = useRef(0);
   const [sleepTimerMinLeft, setSleepTimerMinLeft] = useState<number | null>(null);
 
   const [rightPanel, setRightPanel] = useState<RightPanelTab>('closed');
@@ -478,7 +604,14 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const [libraryFilter, setLibraryFilter] = useState<LibraryFilter>('LIBRARY');
   const [selectedTagId, setSelectedTagId] = useState<string | null>(null);
   const [ytLoginError, setYtLoginError] = useState<string | null>(null);
-  const clearYtLoginError = useCallback(() => setYtLoginError(null), []);
+  const [ytLoginRetryable, setYtLoginRetryable] = useState(false);
+  const [ytLoginBlocked, setYtLoginBlocked] = useState(false);
+  const ytLoginOptionsRef = useRef<{ cleanPartition?: boolean } | undefined>(undefined);
+  const clearYtLoginError = useCallback(() => {
+    setYtLoginError(null);
+    setYtLoginRetryable(false);
+    setYtLoginBlocked(false);
+  }, []);
 
   const [dynamicArtworkPrimary, setDynamicArtworkPrimary] = useState<string | null>(null);
   const [dynamicArtworkSecondary, setDynamicArtworkSecondary] = useState<string>('#1c1317');
@@ -488,8 +621,21 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     englishLyrics: string[] | null;
     translations: string[];
     source: string | null;
+    provider?: string | null;
+    hasAlternateLanguage?: boolean;
     loading: boolean;
-  }>({ syncedLyrics: null, plainLyrics: null, englishLyrics: null, translations: [], source: null, loading: false });
+  }>({
+    syncedLyrics: null,
+    plainLyrics: null,
+    englishLyrics: null,
+    translations: [],
+    source: null,
+    provider: null,
+    hasAlternateLanguage: false,
+    loading: false,
+  });
+  const lyricsRequestIdRef = useRef(0);
+  const lyricsAbortRef = useRef<AbortController | null>(null);
 
   const ytAccounts = useMemo<YtAccountSummary[]>(
     () => ytAuthStatus?.accounts || [],
@@ -500,6 +646,9 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     if (!ytAuthStatus?.loggedIn) return null;
     const list = ytAuthStatus.accounts || [];
     return (
+      (ytAuthStatus.activeAccountId
+        ? list.find((a) => a.id === ytAuthStatus.activeAccountId)
+        : undefined) ||
       list.find((a) => a.accountIndex === ytAuthStatus.accountIndex) ||
       list[0] || {
         id: 'ytm-active',
@@ -531,6 +680,132 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       setToast((curr) => (curr?.id === id ? null : curr));
     }, 4200);
   }, []);
+
+  const commitLikedTrackSets = useCallback(
+    (
+      nextYtmLikedIds: Iterable<string>,
+      nextLocalLikedIds: Iterable<string>,
+      updateTrackFlags = true,
+    ) => {
+      const remote = Array.from(new Set(Array.from(nextYtmLikedIds).filter(Boolean)));
+      const local = Array.from(new Set(Array.from(nextLocalLikedIds).filter(Boolean)));
+      const aggregate = mergeLikedTrackIds(remote, local);
+
+      ytmLikedTrackIdsRef.current = new Set(remote);
+      localLikedTrackIdsRef.current = new Set(local);
+      setYtmLikedTrackIds(remote);
+      setLocalLikedTrackIds(local);
+
+      setPlaylists((prev) => {
+        const existing = prev.find((playlist) => playlist.id === 'pl-liked');
+        if (existing) {
+          return prev.map((playlist) =>
+            playlist.id === 'pl-liked'
+              ? {
+                  ...playlist,
+                  trackIds: aggregate,
+                }
+              : playlist,
+          );
+        }
+        return [
+          {
+            id: 'pl-liked',
+            name: 'Liked Songs',
+            description: 'Your favorite tracks saved in Riri Player',
+            trackIds: aggregate,
+            tagIds: [],
+            createdAt: Date.now(),
+            isSystem: true,
+          },
+          ...prev,
+        ];
+      });
+
+      if (updateTrackFlags) {
+        setTracks((prev) => applyLikedTrackIdsToTracks(prev, aggregate));
+      }
+      setCurrentTrack((current) =>
+        current ? { ...current, liked: aggregate.includes(current.id) } : current,
+      );
+    },
+    [],
+  );
+
+  const clearYtAccountLibraryState = useCallback(
+    (nextAccountId?: string | null) => {
+      accountEpochRef.current += 1;
+      queueNextRequestIdRef.current += 1;
+      const independentTrackIds = collectIndependentYtTrackIds(
+        playlistsRef.current,
+        localLikedTrackIdsRef.current,
+      );
+      const scopeAccountTracks = (items: Track[]): Track[] =>
+        scopeYtMusicTracksToAccount(items, nextAccountId, independentTrackIds);
+
+      setTracks((prev) => scopeAccountTracks(prev));
+      const scopedQueue = scopeAccountTracks(queueRef.current);
+      queueRef.current = scopedQueue;
+      setQueue(scopedQueue);
+      const scopedQueueIndex =
+        scopedQueue.length > 0
+          ? Math.max(0, Math.min(queueIndexRef.current, scopedQueue.length - 1))
+          : 0;
+      queueIndexRef.current = scopedQueueIndex;
+      setQueueIndex(scopedQueueIndex);
+      const scopedCurrent = currentTrackRef.current
+        ? scopeAccountTracks([currentTrackRef.current])[0] || null
+        : null;
+      currentTrackRef.current = scopedCurrent;
+      setCurrentTrack(scopedCurrent);
+      if (!scopedCurrent) {
+        audioEngine.pause();
+        setIsPlaying(false);
+        setPositionSec(0);
+        setDurationSec(0);
+      }
+      setPlaylists((prev) => prev.filter((playlist) => !playlist.ytBrowseId));
+      setYtSavedAlbums([]);
+      setYtFollowedArtists([]);
+      setYtUploadedTracks([]);
+      setYtHistoryTracks([]);
+      setLastLibrarySyncAt(null);
+      setBrowsedCollections({});
+      setChartsTracks([]);
+      setQueueNextResult(null);
+      setHomeSections([]);
+      setHomeTracks([]);
+      setHomeChips([]);
+      setSelectedHomeChipParams(null);
+      setHomeSourceLabel('YouTube Music');
+      ytmLikedTrackIdsRef.current = new Set();
+      setYtmLikedTrackIds([]);
+    },
+    [],
+  );
+
+  const applyAuthoritativeYtStatus = useCallback(
+    (nextStatus: YtAuthStatusPayload) => {
+      if (!isAuthoritativeYtAuthStatus(nextStatus)) {
+        throw new Error('YouTube Music returned an invalid authoritative account status.');
+      }
+      const previousAccountId = ytAuthStatusRef.current?.activeAccountId || null;
+      const nextAccountId = nextStatus.loggedIn
+        ? nextStatus.activeAccountId || null
+        : null;
+      ytAuthStatusRef.current = nextStatus;
+      setYtAuthStatus(nextStatus);
+      setYtAuthVerified(true);
+      if (previousAccountId !== nextAccountId) {
+        clearYtAccountLibraryState(nextAccountId);
+        commitLikedTrackSets([], localLikedTrackIdsRef.current);
+        setYtLoginError(null);
+        setYtLoginRetryable(false);
+        setYtLoginBlocked(false);
+      }
+    },
+    [clearYtAccountLibraryState, commitLikedTrackSets],
+  );
 
   // Subscribe to fullscreen / mini-overlay / sync progress
   useEffect(() => {
@@ -581,84 +856,129 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     let cancelled = false;
     let retryTimer: NodeJS.Timeout | null = null;
 
-    // Track whether we restored from localStorage backup.
-    let restoredFromLocalStorage = false;
-
-    // Restore auth status from localStorage backup immediately (before vault read).
-    // This ensures the user stays signed in even if safeStorage decryption fails.
+    // Restore the sanitized account summary immediately for a flicker-free UI.
+    // The main process remains the source of truth because this backup does
+    // not contain the cookies needed to load Home or synchronize a library.
     try {
       const saved = localStorage.getItem(YT_AUTH_LOCAL_KEY);
       if (saved) {
-        const parsed = JSON.parse(saved) as YtAuthStatusPayload;
+        const parsed = parseOptimisticYtAuthStatus(JSON.parse(saved));
         if (parsed?.loggedIn) {
+          ytAuthStatusRef.current = parsed;
           setYtAuthStatus(parsed);
-          restoredFromLocalStorage = true;
         }
       }
     } catch {
       // ignore localStorage parse errors
     }
 
-    // On every app start, invalidate the vault cache so a fresh read is forced.
-    void ytmClient.invalidateYtmVaultCache();
-
-    const fetchAuth = async () => {
-      if (cancelled) return;
-      const status = await ytmClient.getYtmStatus();
-      if (!cancelled) {
-        // Never overwrite a valid localStorage-restored session with empty vault data.
-        // Only update if:
-        //   - We haven't restored from localStorage yet, OR
-        //   - The vault actually returned a logged-in status (fresher than backup)
-        if (!restoredFromLocalStorage || status.loggedIn) {
-          setYtAuthStatus(status);
-          // Persist successful auth status to localStorage as a backup.
-          if (status.loggedIn) {
-            try {
-              localStorage.setItem(YT_AUTH_LOCAL_KEY, JSON.stringify(status));
-              restoredFromLocalStorage = true;
-            } catch {
-              // ignore
-            }
+    const fetchAuth = async (): Promise<YtAuthStatusPayload | null> => {
+      if (cancelled) return null;
+      const requestMutationVersion = accountMutationVersionRef.current;
+      try {
+        const status = await ytmClient.getYtmStatus();
+        if (requestMutationVersion !== accountMutationVersionRef.current) return null;
+        // Read the diagnostic after the status attempt so it reflects the same
+        // vault read that produced the status. An unreadable vault is not a
+        // confirmed logout and must not erase the renderer backup.
+        const diagnostic = await ytmClient.getYtmVaultDiagnostic().catch(() => null);
+        if (!cancelled) setYtVaultDiagnostic(diagnostic ?? null);
+        if (!cancelled && diagnostic?.unreadableFile) {
+          // The summary may remain visible optimistically, but it is not an
+          // authoritative basis for restoring or overwriting remote state.
+          setYtAuthVerified(false);
+          return null;
+        }
+        if (!cancelled && status.loggedIn) {
+          applyAuthoritativeYtStatus(status);
+          try {
+            localStorage.setItem(YT_AUTH_LOCAL_KEY, JSON.stringify(status));
+          } catch {
+            // ignore
+          }
+        } else if (!cancelled) {
+          applyAuthoritativeYtStatus(status);
+          try {
+            localStorage.removeItem(YT_AUTH_LOCAL_KEY);
+          } catch {
+            // ignore
           }
         }
+        return status;
+      } catch (err) {
+        // A vault/partition restoration failure must not become an unhandled
+        // renderer rejection. Keep the last known summary only as an optimistic
+        // UI state and expose the real diagnostic instead of claiming that the
+        // session was verified.
+        if (!cancelled) {
+          setYtAuthVerified(false);
+          const diagnostic = await ytmClient.getYtmVaultDiagnostic().catch(() => null);
+          setYtVaultDiagnostic({
+            ...(diagnostic || {}),
+            error:
+              diagnostic?.error ||
+              (err instanceof Error ? err.message : 'Failed to read YouTube Music sign-in status.'),
+          });
+        }
+        return null;
       }
     };
 
     const initAuth = async () => {
       if (cancelled) return;
 
-      // Fetch vault diagnostic first so we know whether the vault is readable.
-      const diagnostic = await ytmClient.getYtmVaultDiagnostic().catch(() => null);
-      if (!cancelled) {
-        setYtVaultDiagnostic(diagnostic ?? null);
+      try {
+        // On every app start, invalidate the vault cache so a fresh read is forced.
+        await ytmClient.invalidateYtmVaultCache();
+      } catch (err) {
+        if (!cancelled) {
+          setYtVaultDiagnostic({
+            error:
+              err instanceof Error ? err.message : 'Failed to refresh the session vault.',
+          });
+        }
       }
 
-      // Try auth status immediately.
+      // The status handler also attempts to restore the account from the
+      // persistent YouTube Music login partition before returning.
       await fetchAuth();
 
-      // If not logged in and the vault is unreadable (safeStorage not ready yet),
-      // retry after a short delay so the async encryptor can initialize.
-      // Skip retry if we already restored a valid session from localStorage.
-      if (!cancelled && !restoredFromLocalStorage && diagnostic?.unreadableFile) {
+      // Sample the diagnostic after the status attempt. The earlier value may
+      // have been captured before safeStorage had attempted its first read.
+      const diagnostic = await ytmClient.getYtmVaultDiagnostic().catch(() => null);
+      if (!cancelled) setYtVaultDiagnostic(diagnostic ?? null);
+
+      // If safeStorage was not ready yet, retry independently of the
+      // localStorage summary so a real vault/session is always preferred.
+      if (!cancelled && diagnostic?.unreadableFile) {
         retryTimer = setTimeout(() => {
           if (cancelled) return;
-          void ytmClient.invalidateYtmVaultCache();
-          void fetchAuth();
-
-          // Second retry if still not logged in.
-          if (!ytAuthStatus?.loggedIn) {
-            retryTimer = setTimeout(() => {
-              if (cancelled) return;
-              void ytmClient.invalidateYtmVaultCache();
-              void fetchAuth();
-            }, 2000);
-          }
+          void (async () => {
+            try {
+              await ytmClient.invalidateYtmVaultCache();
+            } catch {
+              // fetchAuth below will surface the diagnostic
+            }
+            const status = await fetchAuth();
+            if (!cancelled && !status?.loggedIn) {
+              retryTimer = setTimeout(() => {
+                if (cancelled) return;
+                void (async () => {
+                  try {
+                    await ytmClient.invalidateYtmVaultCache();
+                  } catch {
+                    // ignore; fetchAuth reports the failure
+                  }
+                  await fetchAuth();
+                })();
+              }, 2000);
+            }
+          })();
         }, 1000);
       }
     };
 
-    void initAuth();
+    void initAuth().catch(() => undefined);
 
     void ytmClient
       .getSpotifyStatus()
@@ -671,7 +991,7 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       cancelled = true;
       if (retryTimer) clearTimeout(retryTimer);
     };
-  }, [proxyReady]);
+  }, [applyAuthoritativeYtStatus, proxyReady]);
 
   const toggleAppFullscreen = useCallback(() => {
     const api = getElectronBridge();
@@ -727,46 +1047,102 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     }
   }, []);
 
-  // Hydrate persistent library state + saved playback queue from IndexedDB
+  // Hydrate persistent library state + saved playback queue from IndexedDB.
+  // Local/independent state is restored immediately. YouTube Music-owned state
+  // is held until the encrypted vault identifies the authoritative account.
   useEffect(() => {
     let cancelled = false;
     Promise.all([loadLibraryStateFromDb(), loadQueueStateFromDb()])
       .then(([persisted, savedQueue]) => {
         if (cancelled) return;
+        let independentTrackIds = new Set<string>();
         if (persisted) {
-          setTracks((persisted.tracks || []).map(redecorateTrack));
-          setPlaylists(
-            (persisted.playlists?.length ? persisted.playlists : DEFAULT_PLAYLISTS).map(
-              redecoratePlaylist,
-            ),
+          const persistedTracks = (persisted.tracks || []).map(redecorateTrack);
+          const persistedPlaylists = (
+            persisted.playlists?.length ? persisted.playlists : DEFAULT_PLAYLISTS
+          ).map(redecoratePlaylist);
+          const persistedLikedIds =
+            persistedPlaylists.find((playlist) => playlist.id === 'pl-liked')?.trackIds || [];
+          const likedSets = deriveLikedTrackSets({
+            persistedLikedIds,
+            persistedYtmLikedIds: persisted.ytmLikedTrackIds,
+            persistedLocalLikedIds: persisted.localLikedTrackIds,
+            tracks: persistedTracks,
+            playlists: persistedPlaylists,
+          });
+          independentTrackIds = collectIndependentYtTrackIds(
+            persistedPlaylists,
+            likedSets.localLikedIds,
           );
+          const safeTracks = scopeYtMusicTracksToAccount(
+            persistedTracks,
+            null,
+            independentTrackIds,
+          );
+          const safePlaylists = persistedPlaylists.filter(
+            (playlist) => !playlist.ytBrowseId,
+          );
+          const safeAggregateLikedIds = mergeLikedTrackIds([], likedSets.localLikedIds);
+
+          setTracks(applyLikedTrackIdsToTracks(safeTracks, safeAggregateLikedIds));
+          setPlaylists(safePlaylists);
+          commitLikedTrackSets([], likedSets.localLikedIds, false);
           setTags(persisted.tags?.length ? persisted.tags : DEFAULT_TAGS);
           setPlayEvents(persisted.playEvents || []);
           setSearchHistory(persisted.searchHistory || []);
           setPlugins(persisted.plugins || []);
-          setYtSavedAlbums((persisted.ytSavedAlbums || []).map(redecorateBrowseItem));
-          setYtFollowedArtists((persisted.ytFollowedArtists || []).map(redecorateBrowseItem));
-          setYtUploadedTracks((persisted.ytUploadedTracks || []).map(redecorateTrack));
-          setYtHistoryTracks((persisted.ytHistoryTracks || []).map(redecorateTrack));
-          if (persisted.lastLibrarySyncAt) {
-            setLastLibrarySyncAt(persisted.lastLibrarySyncAt);
-          }
+          setYtSavedAlbums([]);
+          setYtFollowedArtists([]);
+          setYtUploadedTracks([]);
+          setYtHistoryTracks([]);
+          setLastLibrarySyncAt(null);
           if (persisted.spotifyConnection) {
             setSpotifyConnection((curr) => curr || persisted.spotifyConnection || null);
           }
+
+          // Preserve the original snapshot until the authoritative account is
+          // known. If its account id matches, the remote snapshot can be
+          // restored safely; otherwise only independent state survives.
+          pendingPersistedLibraryRef.current = {
+            ...persisted,
+            tracks: persistedTracks,
+            playlists: persistedPlaylists,
+            ytmLikedTrackIds: likedSets.ytmLikedIds,
+            localLikedTrackIds: likedSets.localLikedIds,
+          };
         }
         if (savedQueue && savedQueue.queue.length > 0) {
-          const safeIdx = Math.max(
-            0,
-            Math.min(savedQueue.queueIndex || 0, savedQueue.queue.length - 1),
+          // Restore only independent/local entries immediately. Remote queue
+          // entries remain pending until the encrypted vault identifies their
+          // owner account.
+          pendingPersistedQueueRef.current = {
+            state: savedQueue,
+            independentTrackIds: new Set(independentTrackIds),
+            libraryAccountId: persisted?.activeYtAccountId || null,
+          };
+          const scopedQueue = scopeYtMusicTracksToAccount(
+            savedQueue.queue,
+            null,
+            independentTrackIds,
           );
-          setQueue(savedQueue.queue);
-          setQueueIndex(safeIdx);
+          const originalCurrentId = savedQueue.queue[savedQueue.queueIndex]?.id;
+          const retainedCurrentIndex = scopedQueue.findIndex(
+            (track) => track.id === originalCurrentId,
+          );
+          const safeIdx =
+            retainedCurrentIndex >= 0
+              ? retainedCurrentIndex
+              : Math.max(
+                  0,
+                  Math.min(savedQueue.queueIndex || 0, scopedQueue.length - 1),
+                );
+          setQueue(scopedQueue);
+          setQueueIndex(scopedQueue.length > 0 ? safeIdx : 0);
           setRepeatMode(savedQueue.repeatMode || 'OFF');
           setShuffleEnabled(Boolean(savedQueue.shuffleEnabled));
-          setCurrentTrack(savedQueue.queue[safeIdx] || null);
+          setCurrentTrack(scopedQueue[safeIdx] || null);
           setPositionSec(savedQueue.positionSec || 0);
-          setDurationSec(savedQueue.queue[safeIdx]?.durationSec || 0);
+          setDurationSec(scopedQueue[safeIdx]?.durationSec || 0);
         }
         setDbHydrated(true);
       })
@@ -776,12 +1152,156 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [commitLikedTrackSets]);
 
-  // Persist sanitized library state to IndexedDB
+  // Apply the persisted YouTube Music snapshot only after the encrypted vault
+  // has been read successfully and its active account matches the snapshot.
   useEffect(() => {
-    if (!dbHydrated) return;
+    if (!dbHydrated || !ytAuthVerified) return;
+    const persisted = pendingPersistedLibraryRef.current;
+    if (!persisted) return;
+    pendingPersistedLibraryRef.current = null;
+
+    const activeAccountId =
+      ytAuthStatus?.loggedIn && ytAuthStatus.activeAccountId
+        ? ytAuthStatus.activeAccountId
+        : null;
+    const persistedAccountId = persisted.activeYtAccountId || null;
+    const accountMatches = isPersistedYtAccountMatch(
+      activeAccountId,
+      persistedAccountId,
+    );
+
+    const persistedTracks = (persisted.tracks || []).map(redecorateTrack);
+    const persistedPlaylists = (
+      persisted.playlists?.length ? persisted.playlists : DEFAULT_PLAYLISTS
+    ).map(redecoratePlaylist);
+    const likedSets = deriveLikedTrackSets({
+      persistedLikedIds:
+        persistedPlaylists.find((playlist) => playlist.id === 'pl-liked')?.trackIds || [],
+      persistedYtmLikedIds: persisted.ytmLikedTrackIds,
+      persistedLocalLikedIds: persisted.localLikedTrackIds,
+      tracks: persistedTracks,
+      playlists: persistedPlaylists,
+    });
+    const independentTrackIds = collectIndependentYtTrackIds(
+      persistedPlaylists,
+      likedSets.localLikedIds,
+    );
+    const accountCandidate = accountMatches && activeAccountId
+      ? tagYtMusicTracksForAccount(
+          persistedTracks,
+          activeAccountId,
+          independentTrackIds,
+        )
+      : persistedTracks;
+    const scopedTracks = scopeYtMusicTracksToAccount(
+      accountCandidate,
+      activeAccountId,
+      independentTrackIds,
+    );
+    const scopedPlaylists = accountMatches
+      ? persistedPlaylists
+      : persistedPlaylists.filter((playlist) => !playlist.ytBrowseId);
+    const authorizedYtmLikedIds = accountMatches ? likedSets.ytmLikedIds : [];
+    const aggregateLikedIds = mergeLikedTrackIds(
+      authorizedYtmLikedIds,
+      likedSets.localLikedIds,
+    );
+
+    setTracks(applyLikedTrackIdsToTracks(scopedTracks, aggregateLikedIds));
+    setPlaylists(scopedPlaylists);
+    commitLikedTrackSets(authorizedYtmLikedIds, likedSets.localLikedIds, false);
+    setYtSavedAlbums(
+      accountMatches
+        ? (persisted.ytSavedAlbums || []).map(redecorateBrowseItem)
+        : [],
+    );
+    setYtFollowedArtists(
+      accountMatches
+        ? (persisted.ytFollowedArtists || []).map(redecorateBrowseItem)
+        : [],
+    );
+    setYtUploadedTracks(
+      accountMatches
+        ? (persisted.ytUploadedTracks || []).map(redecorateTrack)
+        : [],
+    );
+    setYtHistoryTracks(
+      accountMatches
+        ? (persisted.ytHistoryTracks || []).map(redecorateTrack)
+        : [],
+    );
+    setLastLibrarySyncAt(accountMatches ? persisted.lastLibrarySyncAt || null : null);
+  }, [
+    commitLikedTrackSets,
+    dbHydrated,
+    ytAuthStatus?.activeAccountId,
+    ytAuthStatus?.loggedIn,
+    ytAuthVerified,
+  ]);
+
+  // Restore account-owned queue entries only after the vault has identified
+  // the same account that owned the persisted library/queue snapshot.
+  useEffect(() => {
+    if (!dbHydrated || !ytAuthVerified) return;
+    const pending = pendingPersistedQueueRef.current;
+    if (!pending) return;
+    pendingPersistedQueueRef.current = null;
+
+    const activeAccountId =
+      ytAuthStatus?.loggedIn && ytAuthStatus.activeAccountId
+        ? ytAuthStatus.activeAccountId
+        : null;
+    const queueOwnerId = pending.state.activeYtAccountId || null;
+    const ownerMatches = isPersistedYtQueueOwnedByAccount(
+      activeAccountId,
+      queueOwnerId,
+      pending.libraryAccountId,
+    );
+    const candidate = ownerMatches && activeAccountId
+      ? tagYtMusicTracksForAccount(
+          pending.state.queue,
+          activeAccountId,
+          pending.independentTrackIds,
+        )
+      : pending.state.queue;
+    const scopedQueue = scopeYtMusicTracksToAccount(
+      candidate,
+      activeAccountId,
+      pending.independentTrackIds,
+    );
+    const originalCurrentId =
+      pending.state.queue[pending.state.queueIndex]?.id;
+    const retainedCurrentIndex = scopedQueue.findIndex(
+      (track) => track.id === originalCurrentId,
+    );
+    const safeIdx =
+      retainedCurrentIndex >= 0
+        ? retainedCurrentIndex
+        : Math.max(
+            0,
+            Math.min(pending.state.queueIndex || 0, scopedQueue.length - 1),
+          );
+
+    setQueue(scopedQueue);
+    setQueueIndex(scopedQueue.length > 0 ? safeIdx : 0);
+    setCurrentTrack(scopedQueue[safeIdx] || null);
+    setPositionSec(pending.state.positionSec || 0);
+    setDurationSec(scopedQueue[safeIdx]?.durationSec || 0);
+  }, [
+    dbHydrated,
+    ytAuthStatus?.activeAccountId,
+    ytAuthStatus?.loggedIn,
+    ytAuthVerified,
+  ]);
+
+  // Persist sanitized library state to IndexedDB. Do not overwrite a stored
+  // account snapshot while the encrypted vault is still unreadable/unverified.
+  useEffect(() => {
+    if (!dbHydrated || !ytAuthVerified) return;
     const timer = window.setTimeout(() => {
+      if (isResettingRef.current) return;
       void saveLibraryStateToDb({
         tracks,
         playlists,
@@ -789,18 +1309,23 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         playEvents,
         searchHistory,
         plugins,
+        activeYtAccountId: ytAuthStatus?.activeAccountId || null,
         ytSavedAlbums,
         ytFollowedArtists,
         ytUploadedTracks,
         ytHistoryTracks,
         lastLibrarySyncAt: lastLibrarySyncAt || undefined,
         spotifyConnection,
+        ytmLikedTrackIds,
+        localLikedTrackIds,
       });
     }, 250);
     return () => window.clearTimeout(timer);
   }, [
     dbHydrated,
     lastLibrarySyncAt,
+    ytAuthStatus?.activeAccountId,
+    localLikedTrackIds,
     playEvents,
     playlists,
     plugins,
@@ -812,12 +1337,16 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     ytHistoryTracks,
     ytSavedAlbums,
     ytUploadedTracks,
+    ytmLikedTrackIds,
+    ytAuthVerified,
   ]);
 
-  // Persist queue snapshot periodically when queue changes
+  // Persist queue snapshot periodically when queue changes. An unreadable or
+  // unverified vault must not overwrite the last known account-owned queue.
   useEffect(() => {
-    if (!dbHydrated) return;
+    if (!dbHydrated || !ytAuthVerified) return;
     const timer = window.setTimeout(() => {
+      if (isResettingRef.current) return;
       void saveQueueStateToDb({
         queue,
         queueIndex,
@@ -825,10 +1354,20 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         shuffleEnabled,
         positionSec,
         savedAt: Date.now(),
+        activeYtAccountId: ytAuthStatus?.activeAccountId || null,
       });
     }, 500);
     return () => window.clearTimeout(timer);
-  }, [dbHydrated, positionSec, queue, queueIndex, repeatMode, shuffleEnabled]);
+  }, [
+    dbHydrated,
+    positionSec,
+    queue,
+    queueIndex,
+    repeatMode,
+    shuffleEnabled,
+    ytAuthStatus?.activeAccountId,
+    ytAuthVerified,
+  ]);
 
   useEffect(() => {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
@@ -924,6 +1463,13 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
           gl: settings.contentRegion || 'US',
           hl: settings.contentLanguage || 'en',
         });
+        if (
+          !data.sections?.length &&
+          !data.tracks?.length &&
+          !data.chips?.length
+        ) {
+          throw new Error('YouTube Music returned an empty Home feed.');
+        }
         if (!cancelled) {
           setHomeSections(data.sections || []);
           if (!selectedHomeChipParams && data.chips && data.chips.length > 0) {
@@ -946,6 +1492,7 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
           setHomeSections([]);
           setHomeTracks([]);
           setHomeLoading(false);
+          showToast('Could not load YouTube Music Home. Check your connection and try again.', 'error');
         }
       }
     };
@@ -963,6 +1510,7 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     settings.contentLanguage,
     settings.contentRegion,
     settings.ytMusicEnabled,
+    showToast,
     tracks,
   ]);
 
@@ -977,33 +1525,43 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         [cleanId]: {
           title: prev[cleanId]?.title || titleHint,
           subtitle: prev[cleanId]?.subtitle || 'Loading from YouTube Music...',
+          thumbnailUrl: prev[cleanId]?.thumbnailUrl || '',
           tracks: prev[cleanId]?.tracks || [],
           cards: prev[cleanId]?.cards || [],
           loading: true,
         },
       }));
+      const requestAccountId = ytAuthStatusRef.current?.activeAccountId || null;
       try {
         const data = await ytmClient.browseCollection({
           browseId: cleanId,
           gl: settings.contentRegion || 'US',
           hl: settings.contentLanguage || 'en',
         });
+        if ((ytAuthStatusRef.current?.activeAccountId || null) !== requestAccountId) {
+          return;
+        }
         setBrowsedCollections((prev) => ({
           ...prev,
           [cleanId]: {
             title: data.title || titleHint,
             subtitle: data.subtitle || `${(data.tracks || []).length} track(s)`,
+            thumbnailUrl: data.thumbnailUrl || '',
             tracks: data.tracks || [],
             cards: data.items || [],
             loading: false,
           },
         }));
       } catch {
+        if ((ytAuthStatusRef.current?.activeAccountId || null) !== requestAccountId) {
+          return;
+        }
         setBrowsedCollections((prev) => ({
           ...prev,
           [cleanId]: {
             title: titleHint,
             subtitle: 'Could not load this YouTube Music item.',
+            thumbnailUrl: '',
             tracks: [],
             cards: [],
             loading: false,
@@ -1034,20 +1592,24 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     void loadCharts();
   }, [loadCharts, proxyReady]);
 
+  const effectiveThemeColor =
+    settings.dynamicThemeFromArtwork && dynamicArtworkPrimary
+      ? dynamicArtworkPrimary
+      : settings.themeColor;
+
   // Theme application
   useEffect(() => {
-    const seed =
-      settings.dynamicThemeFromArtwork && dynamicArtworkPrimary
-        ? dynamicArtworkPrimary
-        : settings.themeColor;
-    applyMaterialTheme(seed, settings.darkMode, settings.pureBlack, settings.themeSurfaceStyle);
+    applyMaterialTheme(
+      effectiveThemeColor,
+      settings.darkMode,
+      settings.pureBlack,
+      settings.themeSurfaceStyle,
+    );
   }, [
+    effectiveThemeColor,
     settings.darkMode,
     settings.pureBlack,
     settings.themeSurfaceStyle,
-    settings.themeColor,
-    settings.dynamicThemeFromArtwork,
-    dynamicArtworkPrimary,
   ]);
 
   useEffect(() => {
@@ -1095,106 +1657,186 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     }
   }, [activeEq]);
 
-  // Fetch synced lyrics (LRCLIB + YouTube Music fallback) + optional translation + English transliteration
+  // Fetch lyrics, then load optional translation/transliteration without
+  // delaying the native lyric display. Every request is scoped to the active
+  // track so a fast track change cannot overwrite the newer song's lyrics.
   const fetchLyricsForTrack = useCallback(
-    async (track: Track) => {
-      setActiveTrackLyrics({
-        syncedLyrics: track.syncedLyrics || null,
-        plainLyrics: track.plainLyrics || null,
-        englishLyrics: null,
-        translations: [],
-        source: null,
-        loading: !(track.syncedLyrics || track.plainLyrics),
-      });
+    async (track: Track, options?: { forceRefresh?: boolean }) => {
+      const requestId = ++lyricsRequestIdRef.current;
+      lyricsAbortRef.current?.abort();
+      const controller = new AbortController();
+      lyricsAbortRef.current = controller;
+      const isCurrentRequest = () => requestId === lyricsRequestIdRef.current;
+      const queueSourceVideoId = queueNextResult?.sourceVideoId;
+      const lyricsBrowseId =
+        queueSourceVideoId && queueSourceVideoId === track.ytMusicVideoId
+          ? queueNextResult?.lyricsBrowseId
+          : undefined;
 
       let synced = track.syncedLyrics || null;
       let plain = track.plainLyrics || null;
       let source: string | null = synced || plain ? 'Cached' : null;
-
-      if (!synced && !plain) {
-        try {
-          const data = await ytmClient.getLyrics({
-            title: track.title,
-            artist: track.artist,
-            videoId: track.ytMusicVideoId,
-            lyricsBrowseId: queueNextResult?.lyricsBrowseId,
-            gl: settings.contentRegion || 'US',
-            hl: settings.contentLanguage || 'en',
-          });
-          synced = data.syncedLyrics || null;
-          plain = data.plainLyrics || null;
-          source = data.source || null;
-        } catch {
-          // ignore
-        }
-      }
-
-      // Fetch English transliteration for non-Latin script lyrics
-      let englishLyrics: string[] | null = null;
-      if (synced) {
-        const parsed = parseLrcLyrics(synced);
-        if (parsed.length > 0) {
-          // Check if lyrics contain non-Latin characters
-          const hasNonLatin = parsed.some((l) => /[^\u0000-\u007F]/.test(l.text));
-          if (hasNonLatin) {
-            try {
-              const trRes = await apiFetch('/api/transliterate-lyrics', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  lines: parsed.map((l) => l.text),
-                  targetLang: 'en',
-                }),
-              });
-              if (trRes.ok) {
-                const trJson = (await trRes.json()) as { transliteration?: string[] };
-                englishLyrics = trJson.transliteration || null;
-              }
-            } catch {
-              englishLyrics = null;
-            }
-          }
-        }
-      }
-
-      let translations: string[] = [];
-      if (settings.showSyncedLyricsTranslation && synced) {
-        const parsed = parseLrcLyrics(synced);
-        if (parsed.length > 0) {
-          try {
-            const targetIso = LANG_ISO_MAP[settings.translationLanguage] || 'en';
-            const trRes = await apiFetch('/api/translate-lyrics', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                lines: parsed.map((l) => l.text),
-                targetLang: targetIso,
-              }),
-            });
-            if (trRes.ok) {
-              const trJson = (await trRes.json()) as { translations?: string[] };
-              translations = trJson.translations || [];
-            }
-          } catch {
-            translations = [];
-          }
-        }
-      }
+      let provider: string | null = synced || plain ? 'cache' : null;
 
       setActiveTrackLyrics({
         syncedLyrics: synced,
         plainLyrics: plain,
-        englishLyrics,
-        translations,
+        englishLyrics: null,
+        translations: [],
         source,
+        provider,
+        hasAlternateLanguage: false,
+        loading: !(synced || plain),
+      });
+
+      if (!synced && !plain) {
+        try {
+          const result = await lyricsService.fetchLyrics({
+            title: track.title,
+            artist: track.artist,
+            videoId: track.ytMusicVideoId,
+            duration: track.durationSec,
+            lyricsBrowseId,
+            lyricsBrowseVideoId: lyricsBrowseId ? queueSourceVideoId : undefined,
+            gl: settings.contentRegion || 'US',
+            hl: settings.contentLanguage || 'en',
+            providers: settings.lyricsProviders,
+            signal: controller.signal,
+            forceRefresh: options?.forceRefresh,
+          });
+          if (!isCurrentRequest()) return;
+          if (result.ok) {
+            synced = result.syncedLyrics || null;
+            plain = result.plainLyrics || null;
+            source = result.source || null;
+            provider = result.provider || null;
+          }
+        } catch {
+          // A missing lyric provider must not interrupt playback.
+        }
+      }
+
+      if (!isCurrentRequest()) return;
+
+      const lyricText = synced || plain || '';
+      const containsNonLatin = hasNonLatinScript(lyricText);
+      let hasAlternateLanguage = containsNonLatin;
+      const parsed = synced ? parseLrcLyrics(synced) : [];
+      const lyricLines = parsed.length
+        ? parsed.map((line) => line.text)
+        : plain
+          ? plain.split('\n').filter((line) => line.trim().length > 0).slice(0, 120)
+          : [];
+
+      // Show the base lyrics immediately. Transliteration and translation are
+      // optional enhancements and run concurrently in the background.
+      setActiveTrackLyrics({
+        syncedLyrics: synced,
+        plainLyrics: plain,
+        englishLyrics: null,
+        translations: [],
+        source,
+        provider,
+        hasAlternateLanguage,
         loading: false,
       });
+
+      if (lyricLines.length === 0) return;
+
+      const transliterationTask = async (): Promise<{
+        transliteration?: string[];
+        hasAlternateLanguage?: boolean;
+      } | null> => {
+        if (settings.lyricsLanguage !== 'ENGLISH' || !containsNonLatin) return null;
+        try {
+          const response = await apiFetch('/api/transliterate-lyrics', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              lines: lyricLines,
+              targetLang: 'en',
+            }),
+            signal: controller.signal,
+          });
+          if (!response.ok) return null;
+          return (await response.json()) as {
+            transliteration?: string[];
+            hasAlternateLanguage?: boolean;
+          };
+        } catch {
+          return null;
+        }
+      };
+
+      const translationTask = async (): Promise<string[]> => {
+        if (!settings.showSyncedLyricsTranslation || !synced || parsed.length === 0) {
+          return [];
+        }
+        try {
+          const targetIso = LANG_ISO_MAP[settings.translationLanguage] || 'en';
+          const response = await apiFetch('/api/translate-lyrics', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              lines: parsed.map((line) => line.text),
+              targetLang: targetIso,
+            }),
+            signal: controller.signal,
+          });
+          if (!response.ok) return [];
+          const data = (await response.json()) as { translations?: string[] };
+          return data.translations || [];
+        } catch {
+          return [];
+        }
+      };
+
+      const transliterationPromise = transliterationTask().then((result) => {
+        if (!isCurrentRequest() || !result) return result;
+        if (typeof result.hasAlternateLanguage === 'boolean') {
+          hasAlternateLanguage = result.hasAlternateLanguage;
+        }
+        // Apply transliteration as soon as it is ready. Translation is an
+        // unrelated request and must not delay English-mode lyrics.
+        setActiveTrackLyrics((previous) => ({
+          ...previous,
+          englishLyrics: result.transliteration || null,
+          hasAlternateLanguage,
+        }));
+        return result;
+      });
+      const translationPromise = translationTask().then((translations) => {
+        if (!isCurrentRequest()) return translations;
+        setActiveTrackLyrics((previous) => ({
+          ...previous,
+          translations,
+        }));
+        return translations;
+      });
+
+      const [transliteration, translations] = await Promise.all([
+        transliterationPromise,
+        translationPromise,
+      ]);
+      if (!isCurrentRequest()) return;
+
+      if (typeof transliteration?.hasAlternateLanguage === 'boolean') {
+        hasAlternateLanguage = transliteration.hasAlternateLanguage;
+      }
+      setActiveTrackLyrics((previous) => ({
+        ...previous,
+        englishLyrics: transliteration?.transliteration || null,
+        translations,
+        hasAlternateLanguage,
+      }));
     },
     [
       queueNextResult?.lyricsBrowseId,
+      queueNextResult?.sourceVideoId,
       settings.contentLanguage,
       settings.contentRegion,
       settings.lyricsLanguage,
+      settings.lyricsProviders,
       settings.showSyncedLyricsTranslation,
       settings.translationLanguage,
     ],
@@ -1202,22 +1844,65 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
 
   useEffect(() => {
     if (!currentTrack) {
+      lyricsRequestIdRef.current += 1;
+      lyricsAbortRef.current?.abort();
       setActiveTrackLyrics({
         syncedLyrics: null,
         plainLyrics: null,
         englishLyrics: null,
         translations: [],
         source: null,
+        provider: null,
+        hasAlternateLanguage: false,
         loading: false,
       });
-      return;
+      return undefined;
     }
     void fetchLyricsForTrack(currentTrack);
+    return () => {
+      lyricsRequestIdRef.current += 1;
+      lyricsAbortRef.current?.abort();
+    };
   }, [currentTrack, fetchLyricsForTrack]);
+
+  // Warm the next track's lyrics after a short idle period. The service
+  // coalesces duplicate requests and persists successful results, so the next
+  // song can render instantly without adding work to the current track.
+  useEffect(() => {
+    const upcoming = queue[queueIndex + 1];
+    if (
+      !upcoming ||
+      upcoming.source !== 'ytmusic' ||
+      upcoming.syncedLyrics ||
+      upcoming.plainLyrics
+    ) {
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
+      void lyricsService
+        .fetchLyrics({
+          title: upcoming.title,
+          artist: upcoming.artist,
+          videoId: upcoming.ytMusicVideoId,
+          duration: upcoming.durationSec,
+          gl: settings.contentRegion || 'US',
+          hl: settings.contentLanguage || 'en',
+          providers: settings.lyricsProviders,
+        })
+        .catch(() => undefined);
+    }, 900);
+    return () => window.clearTimeout(timer);
+  }, [
+    queue,
+    queueIndex,
+    settings.contentLanguage,
+    settings.contentRegion,
+    settings.lyricsProviders,
+  ]);
 
   const refreshCurrentLyrics = useCallback(async () => {
     if (currentTrack) {
-      await fetchLyricsForTrack(currentTrack);
+      await fetchLyricsForTrack(currentTrack, { forceRefresh: true });
     }
   }, [currentTrack, fetchLyricsForTrack]);
 
@@ -1272,6 +1957,8 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       followAutomixPreview = true,
       options?: { replaceUpcoming?: boolean; title?: string; artist?: string },
     ): Promise<Track[]> => {
+      const requestId = ++queueNextRequestIdRef.current;
+      const requestEpoch = accountEpochRef.current;
       let targetVid = videoId;
       if (!targetVid && !playlistId && options?.title) {
         const searchRes = await ytmClient
@@ -1283,6 +1970,12 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
           })
           .catch(() => null);
         targetVid = searchRes?.tracks?.[0]?.ytMusicVideoId;
+      }
+      if (
+        requestId !== queueNextRequestIdRef.current ||
+        requestEpoch !== accountEpochRef.current
+      ) {
+        return [];
       }
 
       if (!targetVid && !playlistId) return [];
@@ -1297,6 +1990,12 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
           gl: settings.contentRegion || 'US',
           hl: settings.contentLanguage || 'en',
         });
+        if (
+          requestId !== queueNextRequestIdRef.current ||
+          requestEpoch !== accountEpochRef.current
+        ) {
+          return [];
+        }
         if (!data) return [];
         setQueueNextResult(data);
 
@@ -1312,7 +2011,9 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       } catch {
         return [];
       } finally {
-        setQueueNextLoading(false);
+        if (requestId === queueNextRequestIdRef.current) {
+          setQueueNextLoading(false);
+        }
       }
     },
     [settings.contentLanguage, settings.contentRegion],
@@ -1335,6 +2036,8 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       });
     }
 
+    const requestId = ++queueNextRequestIdRef.current;
+    const requestEpoch = accountEpochRef.current;
     setQueueNextLoading(true);
     try {
       const data = await ytmClient.getQueueNext({
@@ -1342,6 +2045,12 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         gl: settings.contentRegion || 'US',
         hl: settings.contentLanguage || 'en',
       });
+      if (
+        requestId !== queueNextRequestIdRef.current ||
+        requestEpoch !== accountEpochRef.current
+      ) {
+        return [];
+      }
       if (!data) return [];
       const newItems = data.items || [];
       setQueueNextResult((prev) => {
@@ -1359,7 +2068,9 @@ export const RiriPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     } catch {
       return [];
     } finally {
-      setQueueNextLoading(false);
+      if (requestId === queueNextRequestIdRef.current) {
+        setQueueNextLoading(false);
+      }
     }
   }, [
     currentTrack,
@@ -1720,46 +2431,93 @@ const playTrack = useCallback(
       if (trackData) {
         ensureTrackInStore(trackData);
       }
-      const currentlyLiked = isTrackLiked(trackId);
-      setTracks((prev) =>
-        prev.map((t) => (t.id === trackId ? { ...t, liked: !currentlyLiked } : t)),
-      );
-      setPlaylists((prev) =>
-        prev.map((pl) => {
-          if (pl.id !== 'pl-liked') return pl;
-          const exists = pl.trackIds.includes(trackId);
-          return {
-            ...pl,
-            trackIds: exists
-              ? pl.trackIds.filter((id) => id !== trackId)
-              : [trackId, ...pl.trackIds],
-          };
-        }),
-      );
-      setCurrentTrack((curr) => (curr?.id === trackId ? { ...curr, liked: !currentlyLiked } : curr));
+
+      const desiredState = likeDesiredStateRef.current.get(trackId);
+      const previousYtmLikedIds = new Set(ytmLikedTrackIdsRef.current);
+      const previousLocalLikedIds = new Set(localLikedTrackIdsRef.current);
+      const wasRemotelyLiked = previousYtmLikedIds.has(trackId);
+      const wasLocallyLiked = previousLocalLikedIds.has(trackId);
+      const currentlyLiked =
+        desiredState ?? (wasRemotelyLiked || wasLocallyLiked || isTrackLiked(trackId));
+      const nextLiked = !currentlyLiked;
+      const mutationVersion = (likeMutationVersionRef.current.get(trackId) || 0) + 1;
+      likeMutationVersionRef.current.set(trackId, mutationVersion);
+      likeDesiredStateRef.current.set(trackId, nextLiked);
+
+      const nextYtmLikedIds = new Set(previousYtmLikedIds);
+      const nextLocalLikedIds = new Set(previousLocalLikedIds);
+      if (nextLiked) {
+        nextLocalLikedIds.add(trackId);
+      } else {
+        nextYtmLikedIds.delete(trackId);
+        nextLocalLikedIds.delete(trackId);
+      }
 
       const targetVideoId =
         trackData?.ytMusicVideoId ||
         tracks.find((t) => t.id === trackId)?.ytMusicVideoId ||
         (currentTrack?.id === trackId ? currentTrack.ytMusicVideoId : undefined);
-      if (ytAuthStatus?.loggedIn && targetVideoId) {
-        void ytmClient
-          .likeYtmTrack(
-            targetVideoId,
-            !currentlyLiked,
-            settings.contentRegion || 'US',
-            settings.contentLanguage || 'en',
-          )
-          .catch(() => undefined);
+      const canSyncRemotely = Boolean(ytAuthStatus?.loggedIn && targetVideoId);
+      const requestAccountId = ytAuthStatus?.activeAccountId || null;
+      const requestEpoch = accountEpochRef.current;
+
+      if (nextLiked && canSyncRemotely) {
+        // The remote set is authoritative for tracks that can be represented in
+        // YouTube Music. A local/Spotify like remains in its own set.
+        nextYtmLikedIds.add(trackId);
+        nextLocalLikedIds.delete(trackId);
       }
+      commitLikedTrackSets(nextYtmLikedIds, nextLocalLikedIds);
+
+      if (!canSyncRemotely) {
+        if (ytAuthStatus?.loggedIn && nextLiked && !targetVideoId) {
+          showToast(
+            'Saved locally. This track has no YouTube Music video ID to synchronize.',
+            'info',
+          );
+        }
+        return;
+      }
+
+      const shouldSyncRemotely = nextLiked || wasRemotelyLiked;
+      if (!shouldSyncRemotely) return;
+
+      const rollback = () => {
+        if (likeMutationVersionRef.current.get(trackId) !== mutationVersion) return;
+        if (
+          requestEpoch !== accountEpochRef.current ||
+          (ytAuthStatusRef.current?.activeAccountId || null) !== requestAccountId
+        ) {
+          return;
+        }
+        likeDesiredStateRef.current.set(trackId, currentlyLiked);
+        commitLikedTrackSets(previousYtmLikedIds, previousLocalLikedIds);
+        showToast('Could not update the liked song in YouTube Music.', 'error');
+      };
+
+      void ytmClient
+        .likeYtmTrack(
+          targetVideoId as string,
+          nextLiked,
+          settings.contentRegion || 'US',
+          settings.contentLanguage || 'en',
+          requestAccountId,
+        )
+        .then((result) => {
+          if (!result.ok) rollback();
+        })
+        .catch(rollback);
     },
     [
+      commitLikedTrackSets,
       currentTrack,
       ensureTrackInStore,
       isTrackLiked,
       settings.contentLanguage,
       settings.contentRegion,
+      showToast,
       tracks,
+      ytAuthStatus?.activeAccountId,
       ytAuthStatus?.loggedIn,
     ],
   );
@@ -1799,6 +2557,7 @@ const playTrack = useCallback(
         }),
       );
       if (ytAuthStatus?.loggedIn && targetPl?.ytBrowseId && track.ytMusicVideoId) {
+        const requestAccountId = ytAuthStatusRef.current?.activeAccountId || null;
         void apiFetch('/api/ytmusic/edit-playlist', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1807,6 +2566,7 @@ const playTrack = useCallback(
             videoId: track.ytMusicVideoId,
             gl: settings.contentRegion || 'US',
             hl: settings.contentLanguage || 'en',
+            expectedAccountId: requestAccountId,
           }),
         }).catch(() => undefined);
       }
@@ -1874,6 +2634,7 @@ const playTrack = useCallback(
   const applySyncedYtLibraryPayload = useCallback(
     (data: {
       likedTracks?: Track[];
+      libraryTracks?: Track[];
       playlists?: Array<{
         browseId: string;
         playlistId?: string;
@@ -1881,124 +2642,150 @@ const playTrack = useCallback(
         subtitle?: string;
         thumbnailUrl?: string;
         tracks?: Track[];
+        tracksComplete?: boolean;
+        tracksIncompleteReason?: string;
       }>;
+      complete?: boolean;
+      playlistsComplete?: boolean;
+      incompleteReason?: string;
       savedAlbums?: YtMusicBrowseItem[];
       followedArtists?: YtMusicBrowseItem[];
       uploadedTracks?: Track[];
       historyTracks?: Track[];
       syncedAt?: number;
-    }) => {
-      const liked = (data.likedTracks || []).map((t) => ({ ...t, liked: true }));
-      const uploads = data.uploadedTracks || [];
-      const history = data.historyTracks || [];
+      accountId?: string | null;
+    }, accountId: string) => {
+      const scopeRemoteTrack = (track: Track): Track => ({
+        ...track,
+        ytAccountId: accountId,
+      });
+      const liked = (data.likedTracks || []).map((t) => ({
+        ...scopeRemoteTrack(t),
+        liked: true,
+      }));
+      const remoteLikedIds = liked.map((track) => track.id);
+      const localLikedIds = Array.from(localLikedTrackIdsRef.current);
+      const aggregateLikedIds = mergeLikedTrackIds(remoteLikedIds, localLikedIds);
+      const libraryTracks = (data.libraryTracks || []).map(scopeRemoteTrack);
+      const uploads = (data.uploadedTracks || []).map(scopeRemoteTrack);
+      const history = (data.historyTracks || []).map(scopeRemoteTrack);
       const cloudPls = data.playlists || [];
 
-      const allToStore: Track[] = [...liked, ...uploads, ...history];
+      const allToStore: Track[] = [...liked, ...libraryTracks, ...uploads, ...history];
       for (const cpl of cloudPls) {
-        if (cpl.tracks?.length) allToStore.push(...cpl.tracks);
+        if (cpl.tracks?.length) allToStore.push(...cpl.tracks.map(scopeRemoteTrack));
       }
 
-      if (allToStore.length > 0) {
-        setTracks((prev) => {
-          const map = new Map(prev.map((t) => [t.id, t]));
-          for (const t of allToStore) {
-            const existing = map.get(t.id);
-            map.set(t.id, existing ? { ...existing, ...t } : t);
-          }
-          return Array.from(map.values());
+      const independentTrackIds = collectIndependentYtTrackIds(
+        playlistsRef.current,
+        localLikedIds,
+      );
+      setTracks((prev) => {
+        // A complete snapshot replaces the selected account's remote track
+        // cache. Independent local/Spotify references are retained so stale
+        // remote rows cannot keep deleted songs alive indefinitely.
+        const retained = prev.flatMap((track) => {
+          if (track.source !== 'ytmusic') return [track];
+          if (!independentTrackIds.has(track.id)) return [];
+          const independentTrack = { ...track };
+          delete independentTrack.ytAccountId;
+          return [independentTrack];
         });
-      }
-
-      setPlaylists((prev) => {
-        let hasLiked = false;
-        let next = prev.map((pl) => {
-          if (pl.id !== 'pl-liked') return pl;
-          hasLiked = true;
-          return {
-            ...pl,
-            trackIds: Array.from(new Set([...liked.map((t) => t.id), ...pl.trackIds])),
-          };
-        });
-
-        if (!hasLiked && liked.length > 0) {
-          next.unshift({
-            id: 'pl-liked',
-            name: 'Liked Songs',
-            description: 'Your favorite tracks synced from YouTube Music',
-            trackIds: liked.map((t) => t.id),
-            tagIds: [],
-            coverUrl: liked[0]?.thumbnailUrl,
-            createdAt: Date.now(),
-            isSystem: true,
-          });
-        }
-
-        for (const cpl of cloudPls) {
-          const id = `ytpl-${cpl.browseId}`;
-          const trackIds = (cpl.tracks || []).map((t) => t.id);
-          const existing = next.find((p) => p.id === id);
-          if (existing) {
-            next = next.map((p) =>
-              p.id === id
-                ? {
-                    ...p,
-                    name: cpl.title || p.name,
-                    coverUrl: cpl.thumbnailUrl || p.coverUrl,
-                    trackIds: trackIds.length > 0 ? trackIds : p.trackIds,
-                    ytBrowseId: cpl.browseId,
-                    ytPlaylistId: cpl.playlistId,
-                  }
-                : p,
-            );
-          } else {
-            next = [
-              ...next,
-              {
-                id,
-                name: cpl.title || 'YouTube Music Playlist',
-                description: cpl.subtitle || 'Synced from YouTube Music',
-                trackIds,
-                tagIds: [],
-                coverUrl: cpl.thumbnailUrl || cpl.tracks?.[0]?.thumbnailUrl,
-                createdAt: Date.now(),
-                ytBrowseId: cpl.browseId,
-                ytPlaylistId: cpl.playlistId,
-              },
-            ];
+        const map = new Map(retained.map((t) => [t.id, t]));
+        for (const t of allToStore) {
+          const existing = map.get(t.id);
+          const merged = existing ? { ...existing, ...t } : t;
+          // A track referenced by an independent playlist/local like remains
+          // independent even when the same video is also in this account's
+          // authoritative remote snapshot.
+          if (independentTrackIds.has(merged.id)) {
+            delete merged.ytAccountId;
           }
+          map.set(merged.id, merged);
         }
-        return next;
+        // The remote YTM liked set is authoritative within its own source, but
+        // it cannot erase independent local or Spotify likes.
+        return applyLikedTrackIdsToTracks(Array.from(map.values()), aggregateLikedIds);
       });
+      commitLikedTrackSets(remoteLikedIds, localLikedIds, false);
 
-      if (data.savedAlbums) setYtSavedAlbums(data.savedAlbums);
-      if (data.followedArtists) setYtFollowedArtists(data.followedArtists);
-      if (data.uploadedTracks) setYtUploadedTracks(data.uploadedTracks);
-      if (data.historyTracks) setYtHistoryTracks(data.historyTracks);
-      if (data.syncedAt) setLastLibrarySyncAt(data.syncedAt);
+      setPlaylists((prev) =>
+        mergeSyncedYtPlaylists(prev, cloudPls, data.playlistsComplete),
+      );
+
+      setYtSavedAlbums(data.savedAlbums || []);
+      setYtFollowedArtists(data.followedArtists || []);
+      setYtUploadedTracks(data.uploadedTracks || []);
+      setYtHistoryTracks(data.historyTracks || []);
+      setLastLibrarySyncAt(data.syncedAt || null);
     },
-    [],
+    [commitLikedTrackSets],
   );
 
   const syncYtMusicLibrary = useCallback(async (): Promise<{ ok: boolean; message: string }> => {
+    const requestAccountId = ytAuthStatusRef.current?.activeAccountId || null;
+    const requestEpoch = accountEpochRef.current;
+    const requestId = ++librarySyncRequestIdRef.current;
+    if (!requestAccountId) {
+      const message = 'Sign in to YouTube Music before synchronizing the library.';
+      showToast(message, 'error');
+      return { ok: false, message };
+    }
+
     try {
       const data = await ytmClient.syncYtmLibrary(
         settings.contentRegion || 'US',
         settings.contentLanguage || 'en',
       );
-      if (!data.ok) {
-        return { ok: false, message: data.error || 'Library sync failed.' };
+      const isCurrentRequest =
+        requestId === librarySyncRequestIdRef.current &&
+        requestEpoch === accountEpochRef.current &&
+        (ytAuthStatusRef.current?.activeAccountId || null) === requestAccountId;
+      if (!isCurrentRequest) {
+        return {
+          ok: false,
+          message: 'Ignored a stale library sync from a different YouTube Music account.',
+        };
       }
-      applySyncedYtLibraryPayload(data);
+      if (!isAuthoritativeYtLibrarySnapshot(data)) {
+        const message =
+          data.incompleteReason ||
+          data.error ||
+          'Library sync was incomplete; no partial snapshot was applied.';
+        showToast(message, 'error');
+        return { ok: false, message };
+      }
+      if (data.accountId !== requestAccountId) {
+        return {
+          ok: false,
+          message: 'Ignored a stale library sync from a different YouTube Music account.',
+        };
+      }
+      applySyncedYtLibraryPayload(data, requestAccountId);
       const liked = data.likedTracks?.length || 0;
+      const library = data.libraryTracks?.length || 0;
       const pls = data.playlists?.length || 0;
       const albums = data.savedAlbums?.length || 0;
-      showToast(`Synced ${liked} liked songs, ${pls} playlists, ${albums} albums`);
+      showToast(
+        `Synced ${liked} liked songs, ${library} library songs, ${pls} playlists, and ${albums} albums`,
+      );
       return {
         ok: true,
-        message: `Synced ${liked} liked tracks, ${pls} playlists, and ${albums} albums.`,
+        message: `Synced ${liked} liked tracks, ${library} library tracks, ${pls} playlists, and ${albums} albums.`,
       };
-    } catch {
-      return { ok: false, message: 'Library sync failed due to network error.' };
+    } catch (err) {
+      if (
+        requestId !== librarySyncRequestIdRef.current ||
+        requestEpoch !== accountEpochRef.current
+      ) {
+        return { ok: false, message: 'Ignored a stale library sync failure.' };
+      }
+      const message =
+        err instanceof Error && err.message
+          ? `Library sync failed: ${err.message}`
+          : 'Library sync failed due to network error.';
+      showToast(message, 'error');
+      return { ok: false, message };
     }
   }, [
     applySyncedYtLibraryPayload,
@@ -2011,6 +2798,16 @@ const playTrack = useCallback(
     syncYtMusicLibraryRef.current = syncYtMusicLibrary;
   }, [syncYtMusicLibrary]);
 
+  // Restore the complete library after startup/account restoration. The main
+  // process coalesces duplicate account-scoped requests, so this remains safe
+  // when sign-in also starts an immediate synchronization.
+  useEffect(() => {
+    if (!proxyReady || !ytAuthStatus?.loggedIn || !ytAuthStatus.activeAccountId) {
+      return;
+    }
+    void syncYtMusicLibraryRef.current?.();
+  }, [proxyReady, ytAuthStatus?.activeAccountId, ytAuthStatus?.loggedIn]);
+
   const signInWithYouTubeMusic = useCallback(
     async (options?: {
       cleanPartition?: boolean;
@@ -2018,14 +2815,20 @@ const playTrack = useCallback(
       ok: boolean;
       blocked?: boolean;
       cancelled?: boolean;
+      retryable?: boolean;
       message: string;
     }> => {
       setSigningInYtMusic(true);
       setYtLoginError(null);
+      setYtLoginRetryable(false);
+      setYtLoginBlocked(false);
+      ytLoginOptionsRef.current = options;
+      const mutationVersion = ++accountMutationVersionRef.current;
+      setYtAccountMutationPending(true);
       try {
         const res = await ytmClient.loginYtm(options);
-        if (res.status) {
-          setYtAuthStatus(res.status);
+        if (mutationVersion !== accountMutationVersionRef.current) {
+          return { ok: false, cancelled: true, message: '' };
         }
         if (res.cancelled) {
           // User closed the login window (X or Cancel). Reset to "Sign in"
@@ -2033,20 +2836,34 @@ const playTrack = useCallback(
           return { ok: false, cancelled: true, message: '' };
         }
         if (!res.ok) {
-          const msg = res.error || 'YouTube Music sign-in did not complete.';
-          setYtLoginError(msg);
+          const msg =
+            res.error || 'YouTube Music sign-in did not complete.';
+          setYtLoginError(res.warning ? `${msg} ${res.warning}` : msg);
+          setYtLoginRetryable(res.retryable === true);
+          setYtLoginBlocked(res.blocked === true);
           if (!msg.toLowerCase().includes('closed')) {
-            showToast(msg, 'error');
+            showToast(res.warning ? `${msg} ${res.warning}` : msg, 'error');
           }
-          return { ok: false, blocked: res.blocked, message: msg };
+          return {
+            ok: false,
+            blocked: res.blocked,
+            retryable: res.retryable,
+            message: msg,
+          };
         }
 
-        const name = res.status?.accountName || 'YouTube Music User';
+        if (!res.status?.loggedIn || !res.status.activeAccountId) {
+          throw new Error('YouTube Music sign-in completed without a verified account.');
+        }
+        applyAuthoritativeYtStatus(res.status);
+        const name = res.status.accountName || 'YouTube Music User';
         setYtLoginError(null);
+        setYtLoginRetryable(false);
+        setYtLoginBlocked(false);
         showToast(`Signed in to YouTube Music as ${name}. Syncing library...`);
-        // Persist auth status to localStorage backup immediately after sign-in.
-        // This ensures the user stays signed in across app restarts even if
-        // safeStorage vault decryption fails on Windows.
+        if (res.warning) showToast(res.warning, 'info');
+        // Persist the sanitized auth summary for a flicker-free startup. The
+        // encrypted vault remains the source of truth for actual credentials.
         if (res.status) {
           try {
             localStorage.setItem(YT_AUTH_LOCAL_KEY, JSON.stringify(res.status));
@@ -2056,17 +2873,69 @@ const playTrack = useCallback(
         }
         await syncYtMusicLibraryRef.current?.();
         return { ok: true, message: `Signed in as ${name}` };
-      } catch {
-        const msg = 'Could not open YouTube Music sign-in.';
+      } catch (err) {
+        const msg =
+          err instanceof Error && err.message
+            ? err.message
+            : 'Could not open YouTube Music sign-in.';
         setYtLoginError(msg);
+        setYtLoginRetryable(true);
+        setYtLoginBlocked(false);
         showToast(msg, 'error');
-        return { ok: false, message: msg };
+        return { ok: false, retryable: true, message: msg };
       } finally {
         setSigningInYtMusic(false);
+        if (mutationVersion === accountMutationVersionRef.current) {
+          setYtAccountMutationPending(false);
+        }
       }
     },
-    [showToast],
+    [applyAuthoritativeYtStatus, showToast],
   );
+
+  const retryYtMusicSignIn = useCallback(async () => {
+    return await signInWithYouTubeMusic(ytLoginOptionsRef.current);
+  }, [signInWithYouTubeMusic]);
+
+  const resetYtVault = useCallback(async (): Promise<{ ok: boolean; message: string }> => {
+    accountMutationVersionRef.current += 1;
+    const result = await ytmClient.resetYtmVault();
+    if (!result.ok) {
+      const message = result.error || 'Could not reset the encrypted YouTube Music session vault.';
+      setYtVaultDiagnostic({ error: message, unreadableFile: true });
+      showToast(message, 'error');
+      return { ok: false, message };
+    }
+
+    setYtVaultDiagnostic(null);
+    setYtLoginError(null);
+    setYtLoginRetryable(false);
+    setYtLoginBlocked(false);
+    try {
+      const status = await ytmClient.getYtmStatus();
+      applyAuthoritativeYtStatus(status);
+      try {
+        if (status.loggedIn) {
+          localStorage.setItem(YT_AUTH_LOCAL_KEY, JSON.stringify(status));
+        } else {
+          localStorage.removeItem(YT_AUTH_LOCAL_KEY);
+        }
+      } catch {
+        // The encrypted vault remains authoritative if the optimistic backup
+        // cannot be written.
+      }
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'The vault was reset, but its sign-in status could not be verified.';
+      setYtVaultDiagnostic({ error: message, unreadableFile: true });
+      showToast(message, 'error');
+      return { ok: false, message };
+    }
+    showToast('Encrypted session vault reset. The previous file was backed up.');
+    return { ok: true, message: 'Encrypted session vault reset.' };
+  }, [applyAuthoritativeYtStatus, showToast]);
 
   const cancelYtMusicSignIn = useCallback(async () => {
     await ytmClient.ytmCancel();
@@ -2080,14 +2949,23 @@ const playTrack = useCallback(
       accountIndex?: number;
     }): Promise<{ ok: boolean; message: string }> => {
       setSigningInYtMusic(true);
+      const mutationVersion = ++accountMutationVersionRef.current;
+      setYtAccountMutationPending(true);
       try {
         const res = await ytmClient.importYtmBrowserSession(payload);
-        if (!res.ok || !res.status) {
+        if (mutationVersion !== accountMutationVersionRef.current) {
+          return { ok: false, message: 'Ignored a stale browser-session import.' };
+        }
+        if (
+          !res.ok ||
+          !res.status?.loggedIn ||
+          !res.status.activeAccountId
+        ) {
           const msg = res.error || 'Could not validate YouTube Music session.';
           showToast(msg, 'error');
           return { ok: false, message: msg };
         }
-        setYtAuthStatus(res.status);
+        applyAuthoritativeYtStatus(res.status);
         // Persist auth status to localStorage backup after browser session import.
         if (res.status) {
           try {
@@ -2099,61 +2977,113 @@ const playTrack = useCallback(
         showToast(`Signed in as ${res.status.accountName}. Syncing library...`);
         await syncYtMusicLibraryRef.current?.();
         return { ok: true, message: `Signed in as ${res.status.accountName}` };
-      } catch {
-        return { ok: false, message: 'Failed to import browser session.' };
+      } catch (err) {
+        const message =
+          err instanceof Error && err.message
+            ? err.message
+            : 'Failed to import browser session.';
+        showToast(message, 'error');
+        return { ok: false, message };
       } finally {
         setSigningInYtMusic(false);
+        if (mutationVersion === accountMutationVersionRef.current) {
+          setYtAccountMutationPending(false);
+        }
       }
     },
-    [showToast],
+    [applyAuthoritativeYtStatus, showToast],
   );
 
   const switchYtAccount = useCallback(
     async (accountId: string) => {
-      const nextStatus = await ytmClient.switchYtmAccount(accountId);
-      setYtAuthStatus(nextStatus);
-      // Persist auth status to localStorage backup after account switch.
-      if (nextStatus.loggedIn) {
+      const knownAccounts = ytAuthStatusRef.current?.accounts || [];
+      if (!knownAccounts.some((account) => account.id === accountId)) {
+        showToast('Could not switch YouTube Music account: the account no longer exists.', 'error');
+        return;
+      }
+      const mutationVersion = ++accountMutationVersionRef.current;
+      setYtAccountMutationPending(true);
+      try {
+        const nextStatus = await ytmClient.switchYtmAccount(accountId);
+        if (mutationVersion !== accountMutationVersionRef.current) return;
+        if (
+          !nextStatus.loggedIn ||
+          nextStatus.activeAccountId !== accountId ||
+          !nextStatus.accounts?.some((account) => account.id === accountId)
+        ) {
+          throw new Error('The requested YouTube Music account could not be activated.');
+        }
+        applyAuthoritativeYtStatus(nextStatus);
+        // Persist auth status to localStorage backup after account switch.
         try {
           localStorage.setItem(YT_AUTH_LOCAL_KEY, JSON.stringify(nextStatus));
         } catch {
           // ignore
         }
-      } else {
-        try {
-          localStorage.removeItem(YT_AUTH_LOCAL_KEY);
-        } catch {
-          // ignore
+        showToast(`Switched to ${nextStatus.accountName || 'YouTube Music account'}`);
+        await syncYtMusicLibraryRef.current?.();
+      } catch (err) {
+        if (mutationVersion !== accountMutationVersionRef.current) return;
+        const message =
+          err instanceof Error && err.message
+            ? `Could not switch YouTube Music account: ${err.message}`
+            : 'Could not switch YouTube Music account.';
+        showToast(message, 'error');
+      } finally {
+        if (mutationVersion === accountMutationVersionRef.current) {
+          setYtAccountMutationPending(false);
         }
       }
-      showToast(`Switched to ${nextStatus.accountName || 'YouTube Music account'}`);
-      await syncYtMusicLibraryRef.current?.();
     },
-    [showToast],
+    [applyAuthoritativeYtStatus, showToast],
   );
 
   const signOutYtAccount = useCallback(
     async (accountId?: string) => {
-      const nextStatus = await ytmClient.logoutYtmAccount(accountId);
-      setYtAuthStatus(nextStatus);
-      // Clear localStorage auth backup on sign-out.
+      const activeBeforeId = ytAuthStatusRef.current?.activeAccountId || null;
+      if (
+        accountId &&
+        !ytAuthStatusRef.current?.accounts?.some((account) => account.id === accountId)
+      ) {
+        showToast('Could not sign out of YouTube Music: the account no longer exists.', 'error');
+        return;
+      }
+      const mutationVersion = ++accountMutationVersionRef.current;
+      setYtAccountMutationPending(true);
       try {
-        localStorage.removeItem('ririp_c_yt_auth_v1');
-      } catch {
-        // ignore
+        const nextStatus = await ytmClient.logoutYtmAccount(accountId);
+        if (mutationVersion !== accountMutationVersionRef.current) return;
+        applyAuthoritativeYtStatus(nextStatus);
+        // Keep only a sanitized summary when another account remains active.
+        try {
+          if (nextStatus.loggedIn) {
+            localStorage.setItem(YT_AUTH_LOCAL_KEY, JSON.stringify(nextStatus));
+          } else {
+            localStorage.removeItem(YT_AUTH_LOCAL_KEY);
+          }
+        } catch {
+          // ignore
+        }
+        const activeAccountChanged =
+          activeBeforeId !== (nextStatus.activeAccountId || null);
+        if (activeAccountChanged && nextStatus.loggedIn) {
+          await syncYtMusicLibraryRef.current?.();
+        }
+        showToast(nextStatus.loggedIn ? `Switched to ${nextStatus.accountName}` : 'Signed out of YouTube Music');
+      } catch (err) {
+        if (mutationVersion !== accountMutationVersionRef.current) return;
+        const message =
+          err instanceof Error && err.message
+            ? `Could not sign out of YouTube Music: ${err.message}`
+            : 'Could not sign out of YouTube Music.';
+        showToast(message, 'error');
+      } finally {
+        if (mutationVersion === accountMutationVersionRef.current) {
+          setYtAccountMutationPending(false);
+        }
       }
-      if (!nextStatus.loggedIn) {
-        setYtSavedAlbums([]);
-        setYtFollowedArtists([]);
-        setYtUploadedTracks([]);
-        setYtHistoryTracks([]);
-        setPlaylists((prev) => prev.filter((p) => !p.ytBrowseId));
-      } else {
-        await syncYtMusicLibraryRef.current?.();
-      }
-      showToast(nextStatus.loggedIn ? `Switched to ${nextStatus.accountName}` : 'Signed out of YouTube Music');
     },
-    [showToast],
+    [applyAuthoritativeYtStatus, showToast],
   );
 
   // Import playlists via YouTube Music InnerTube browse or Spotify matcher
@@ -2296,7 +3226,18 @@ const playTrack = useCallback(
           return { ok: false, message: msg };
         }
 
-        const liked = (data.likedTracks || []).map((t) => ({ ...t, liked: true }));
+        // Spotify imports are independent user state even though they resolve
+        // to playable YouTube Music tracks. Do not assign them to the active
+        // YouTube Music account or they would be removed on an account switch.
+        const toIndependentSpotifyTrack = (track: Track): Track => {
+          const independentTrack = { ...track };
+          delete independentTrack.ytAccountId;
+          return independentTrack;
+        };
+        const liked = (data.likedTracks || []).map((t) => ({
+          ...toIndependentSpotifyTrack(t),
+          liked: true,
+        }));
         const syncedPlaylists = data.playlists || [];
         
         // Update progress: matching tracks
@@ -2310,7 +3251,9 @@ const playTrack = useCallback(
 
         const allIncoming: Track[] = [...liked];
         for (const spPl of syncedPlaylists) {
-          if (spPl.tracks?.length) allIncoming.push(...spPl.tracks);
+          if (spPl.tracks?.length) {
+            allIncoming.push(...spPl.tracks.map(toIndependentSpotifyTrack));
+          }
         }
 
         // Update progress: importing playlists
@@ -2402,6 +3345,10 @@ const playTrack = useCallback(
           return next;
         });
 
+        const nextLocalLikedIds = new Set(localLikedTrackIdsRef.current);
+        for (const track of liked) nextLocalLikedIds.add(track.id);
+        commitLikedTrackSets(ytmLikedTrackIdsRef.current, nextLocalLikedIds);
+
         const unmatchedSuffix =
           data.unmatchedTracks?.length > 0
             ? ` · ${data.unmatchedTracks.length} unmatched`
@@ -2438,7 +3385,13 @@ const playTrack = useCallback(
         }, 5000);
       }
     },
-    [settings.contentLanguage, settings.contentRegion, showToast, spotifySyncing],
+    [
+      commitLikedTrackSets,
+      settings.contentLanguage,
+      settings.contentRegion,
+      showToast,
+      spotifySyncing,
+    ],
   );
 
   const syncSpotifyLibrary = useCallback(
@@ -2763,11 +3716,16 @@ const playTrack = useCallback(
         playEvents,
         searchHistory,
         ytAuthStatus,
+        activeYtAccountId: ytAuthVerified
+          ? ytAuthStatus?.activeAccountId || null
+          : null,
         spotifyConnection,
         ytSavedAlbums,
         ytFollowedArtists,
         ytUploadedTracks,
         ytHistoryTracks,
+        ytmLikedTrackIds,
+        localLikedTrackIds,
       },
       null,
       2,
@@ -2785,7 +3743,10 @@ const playTrack = useCallback(
     ytUploadedTracks,
     ytHistoryTracks,
     ytAuthStatus,
+    ytAuthVerified,
     spotifyConnection,
+    ytmLikedTrackIds,
+    localLikedTrackIds,
   ]);
 
   const importBackupJson = useCallback(
@@ -2801,11 +3762,14 @@ const playTrack = useCallback(
           playEvents?: PlayEvent[];
           searchHistory?: string[];
           ytAuthStatus?: YtAuthStatusPayload | null;
+          activeYtAccountId?: string | null;
           spotifyConnection?: SpotifyConnection | null;
           ytSavedAlbums?: YtMusicBrowseItem[];
           ytFollowedArtists?: YtMusicBrowseItem[];
           ytUploadedTracks?: Track[];
           ytHistoryTracks?: Track[];
+          ytmLikedTrackIds?: string[];
+          localLikedTrackIds?: string[];
         };
         if (parsed.app !== 'Riri Player' && parsed.app !== 'ArchiveTunePC') {
           return { ok: false, message: 'Invalid Riri Player backup file.' };
@@ -2817,30 +3781,118 @@ const playTrack = useCallback(
           setSettings((s) => ({ ...s, ...(sanitizedSettings as Partial<AppSettings>) }));
         }
         if (parsed.eqState?.profiles?.length) setEqState(parsed.eqState);
-        if (Array.isArray(parsed.tracks)) setTracks(parsed.tracks);
-        if (Array.isArray(parsed.playlists)) setPlaylists(parsed.playlists);
+        const importedTracks = Array.isArray(parsed.tracks) ? parsed.tracks : null;
+        const importedPlaylists = Array.isArray(parsed.playlists) ? parsed.playlists : null;
+        const activeAccountId =
+          ytAuthVerified && ytAuthStatusRef.current?.loggedIn
+            ? ytAuthStatusRef.current.activeAccountId || null
+            : null;
+        // Legacy backups did not persist an explicit library owner. Their
+        // remote state is not safe to restore under a different account.
+        const backupAccountId = parsed.activeYtAccountId || null;
+        const accountMatches = isPersistedYtAccountMatch(
+          activeAccountId,
+          backupAccountId,
+        );
+
+        let likedSets = {
+          ytmLikedIds: [] as string[],
+          localLikedIds: [] as string[],
+        };
+        if (importedTracks || importedPlaylists) {
+          const importedLikedIds =
+            importedPlaylists?.find((playlist) => playlist.id === 'pl-liked')?.trackIds || [];
+          likedSets = deriveLikedTrackSets({
+            persistedLikedIds: importedLikedIds,
+            persistedYtmLikedIds: parsed.ytmLikedTrackIds,
+            persistedLocalLikedIds: parsed.localLikedTrackIds,
+            tracks: importedTracks || [],
+            playlists: importedPlaylists || [],
+          });
+          const independentTrackIds = collectIndependentYtTrackIds(
+            importedPlaylists || [],
+            likedSets.localLikedIds,
+          );
+          const accountCandidate =
+            accountMatches && activeAccountId
+              ? tagYtMusicTracksForAccount(
+                  importedTracks || [],
+                  activeAccountId,
+                  independentTrackIds,
+                )
+              : importedTracks || [];
+          const scopedTracks = scopeYtMusicTracksToAccount(
+            accountCandidate,
+            activeAccountId,
+            independentTrackIds,
+          );
+          const scopedPlaylists = accountMatches
+            ? importedPlaylists || []
+            : (importedPlaylists || []).filter((playlist) => !playlist.ytBrowseId);
+          const authorizedYtmLikedIds = accountMatches ? likedSets.ytmLikedIds : [];
+          const aggregateLikedIds = mergeLikedTrackIds(
+            authorizedYtmLikedIds,
+            likedSets.localLikedIds,
+          );
+
+          if (importedTracks) {
+            setTracks(applyLikedTrackIdsToTracks(scopedTracks, aggregateLikedIds));
+          }
+          if (importedPlaylists) setPlaylists(scopedPlaylists);
+          commitLikedTrackSets(authorizedYtmLikedIds, likedSets.localLikedIds);
+        }
         if (Array.isArray(parsed.tags)) setTags(parsed.tags);
         if (Array.isArray(parsed.playEvents)) setPlayEvents(parsed.playEvents);
         if (Array.isArray(parsed.searchHistory)) setSearchHistory(parsed.searchHistory);
-        if (parsed.ytAuthStatus) setYtAuthStatus(parsed.ytAuthStatus);
+        // Authentication is intentionally not restored from a backup. The
+        // encrypted vault on this device owns the session cookies and remains
+        // the only source of truth for a signed-in YouTube Music account.
         if (parsed.spotifyConnection) setSpotifyConnection(parsed.spotifyConnection);
-        if (Array.isArray(parsed.ytSavedAlbums)) setYtSavedAlbums(parsed.ytSavedAlbums);
-        if (Array.isArray(parsed.ytFollowedArtists)) setYtFollowedArtists(parsed.ytFollowedArtists);
-        if (Array.isArray(parsed.ytUploadedTracks)) setYtUploadedTracks(parsed.ytUploadedTracks);
-        if (Array.isArray(parsed.ytHistoryTracks)) setYtHistoryTracks(parsed.ytHistoryTracks);
-        showToast('Backup restored successfully (accounts included - may need to re-sign in if sessions expired)');
+        setYtSavedAlbums(
+          accountMatches && Array.isArray(parsed.ytSavedAlbums)
+            ? parsed.ytSavedAlbums
+            : [],
+        );
+        setYtFollowedArtists(
+          accountMatches && Array.isArray(parsed.ytFollowedArtists)
+            ? parsed.ytFollowedArtists
+            : [],
+        );
+        setYtUploadedTracks(
+          accountMatches && Array.isArray(parsed.ytUploadedTracks)
+            ? parsed.ytUploadedTracks
+            : [],
+        );
+        setYtHistoryTracks(
+          accountMatches && Array.isArray(parsed.ytHistoryTracks)
+            ? parsed.ytHistoryTracks
+            : [],
+        );
+        showToast(
+          'Backup restored successfully (YouTube Music sessions remain managed by this device)',
+        );
         return { ok: true, message: 'Backup restored successfully.' };
       } catch {
         return { ok: false, message: 'Could not parse backup JSON.' };
       }
     },
-    [showToast],
+    [commitLikedTrackSets, showToast, ytAuthVerified],
   );
 
   // Broadcast playback state for standalone Electron Always-On-Top Mini-Player window
   useEffect(() => {
     if (typeof BroadcastChannel === 'undefined') return;
     const ch = new BroadcastChannel(MINI_OVERLAY_CHANNEL);
+    miniOverlayPublisherRef.current = ch;
+    return () => {
+      if (miniOverlayPublisherRef.current === ch) miniOverlayPublisherRef.current = null;
+      ch.close();
+    };
+  }, []);
+
+  useEffect(() => {
+    const ch = miniOverlayPublisherRef.current;
+    if (!ch) return;
 
     // Compute current synced lyric line
     const parsedLyrics = parseLrcLyrics(activeTrackLyrics.syncedLyrics);
@@ -2849,12 +3901,24 @@ const playTrack = useCallback(
       positionSec * 1000,
       settings.lyricsOffsetMs,
     );
-    const activeLyricLine = activeLyricIdx >= 0 ? parsedLyrics[activeLyricIdx]?.text : null;
+    const nativeLine = activeLyricIdx >= 0 ? parsedLyrics[activeLyricIdx]?.text : null;
+    const activeLyricLine =
+      settings.lyricsLanguage === 'ENGLISH' && activeTrackLyrics.englishLyrics?.[activeLyricIdx]
+        ? activeTrackLyrics.englishLyrics[activeLyricIdx]
+        : nativeLine;
+    const hasSyncedLyrics = Boolean(
+      activeTrackLyrics.syncedLyrics && activeTrackLyrics.syncedLyrics.trim().length > 0
+    );
+    const hasAlternateLanguage = Boolean(
+      activeTrackLyrics.hasAlternateLanguage ||
+        (activeTrackLyrics.englishLyrics && activeTrackLyrics.englishLyrics.length > 0),
+    );
 
     ch.postMessage({
       type: 'STATE',
       payload: {
         currentTrack,
+        liked: currentTrack ? isTrackLiked(currentTrack.id) : false,
         isPlaying,
         positionSec,
         durationSec,
@@ -2863,16 +3927,19 @@ const playTrack = useCallback(
         volume: settings.volume,
         miniOverlayTheme: settings.miniOverlayTheme,
         sliderStyle: settings.sliderStyle,
-        themeSeedColor: settings.themeColor,
+        themeSeedColor: effectiveThemeColor,
         darkMode: settings.darkMode,
+        pureBlack: settings.pureBlack,
         themeSurfaceStyle: settings.themeSurfaceStyle,
         activeLyricLine,
         lyricsLanguage: settings.lyricsLanguage,
+        hasAlternateLanguage,
+        hasSyncedLyrics,
       },
     });
-    return () => ch.close();
   }, [
     currentTrack,
+    isTrackLiked,
     durationSec,
     isPlaying,
     positionSec,
@@ -2881,12 +3948,79 @@ const playTrack = useCallback(
     settings.darkMode,
     settings.miniOverlayTheme,
     settings.sliderStyle,
-    settings.themeColor,
+    effectiveThemeColor,
     settings.themeSurfaceStyle,
+    settings.pureBlack,
     settings.volume,
+    settings.lyricsLanguage,
     activeTrackLyrics.syncedLyrics,
+    activeTrackLyrics.englishLyrics,
+    activeTrackLyrics.hasAlternateLanguage,
     settings.lyricsOffsetMs,
   ]);
+
+  const miniCommandStateRef = useRef({
+    currentTrack,
+    isTrackLiked,
+    toggleLike,
+    isPlaying,
+    durationSec,
+    repeatMode,
+    shuffleEnabled,
+    volume: settings.volume,
+    miniOverlayTheme: settings.miniOverlayTheme,
+    sliderStyle: settings.sliderStyle,
+    themeSeedColor: effectiveThemeColor,
+    darkMode: settings.darkMode,
+    pureBlack: settings.pureBlack,
+    themeSurfaceStyle: settings.themeSurfaceStyle,
+    lyricsLanguage: settings.lyricsLanguage,
+    lyricsOffsetMs: settings.lyricsOffsetMs,
+    syncedLyrics: activeTrackLyrics.syncedLyrics,
+    englishLyrics: activeTrackLyrics.englishLyrics,
+    hasAlternateLanguage: activeTrackLyrics.hasAlternateLanguage,
+    closeMiniPlayer,
+    togglePlayPause,
+    nextTrack,
+    prevTrack,
+    toggleLyricsLanguage,
+    seekTo,
+    toggleShuffle,
+    cycleRepeatMode,
+    updateSettings,
+    toggleRightPanel,
+  });
+  miniCommandStateRef.current = {
+    currentTrack,
+    isTrackLiked,
+    toggleLike,
+    isPlaying,
+    durationSec,
+    repeatMode,
+    shuffleEnabled,
+    volume: settings.volume,
+    miniOverlayTheme: settings.miniOverlayTheme,
+    sliderStyle: settings.sliderStyle,
+    themeSeedColor: effectiveThemeColor,
+    darkMode: settings.darkMode,
+    pureBlack: settings.pureBlack,
+    themeSurfaceStyle: settings.themeSurfaceStyle,
+    lyricsLanguage: settings.lyricsLanguage,
+    lyricsOffsetMs: settings.lyricsOffsetMs,
+    syncedLyrics: activeTrackLyrics.syncedLyrics,
+    englishLyrics: activeTrackLyrics.englishLyrics,
+    hasAlternateLanguage: activeTrackLyrics.hasAlternateLanguage,
+    closeMiniPlayer,
+    togglePlayPause,
+    nextTrack,
+    prevTrack,
+    toggleLyricsLanguage,
+    seekTo,
+    toggleShuffle,
+    cycleRepeatMode,
+    updateSettings,
+    toggleRightPanel,
+  };
 
   useEffect(() => {
     if (typeof BroadcastChannel === 'undefined') return;
@@ -2897,86 +4031,78 @@ const playTrack = useCallback(
       positionSec?: number;
       volume?: number;
     }>) => {
+      const state = miniCommandStateRef.current;
       if (e.data?.type === 'REQUEST_STATE') {
-        // Compute current synced lyric line
-        const parsedLyrics = parseLrcLyrics(activeTrackLyrics.syncedLyrics);
+        // Use the latest playback position without recreating the command channel.
+        const parsedLyrics = parseLrcLyrics(state.syncedLyrics);
         const activeLyricIdx = findActiveLyricIndex(
           parsedLyrics,
-          positionSec * 1000,
-          settings.lyricsOffsetMs,
+          positionSecRef.current * 1000,
+          state.lyricsOffsetMs,
         );
-        const activeLyricLine = activeLyricIdx >= 0 ? parsedLyrics[activeLyricIdx]?.text : null;
+        const nativeLine = activeLyricIdx >= 0 ? parsedLyrics[activeLyricIdx]?.text : null;
+        const activeLyricLine =
+          state.lyricsLanguage === 'ENGLISH' && state.englishLyrics?.[activeLyricIdx]
+            ? state.englishLyrics[activeLyricIdx]
+            : nativeLine;
+        const hasSyncedLyrics = Boolean(
+          state.syncedLyrics && state.syncedLyrics.trim().length > 0
+        );
+        const hasAlternateLanguage = Boolean(
+          state.hasAlternateLanguage ||
+            (state.englishLyrics && state.englishLyrics.length > 0),
+        );
 
         ch.postMessage({
           type: 'STATE',
           payload: {
-            currentTrack,
-            isPlaying,
-            positionSec,
-            durationSec,
-            repeatMode,
-            shuffleEnabled,
-            volume: settings.volume,
-            miniOverlayTheme: settings.miniOverlayTheme,
-            sliderStyle: settings.sliderStyle,
-            themeSeedColor: settings.themeColor,
-            darkMode: settings.darkMode,
-            themeSurfaceStyle: settings.themeSurfaceStyle,
+            currentTrack: state.currentTrack,
+            liked: state.currentTrack ? state.isTrackLiked(state.currentTrack.id) : false,
+            isPlaying: state.isPlaying,
+            positionSec: positionSecRef.current,
+            durationSec: state.durationSec,
+            repeatMode: state.repeatMode,
+            shuffleEnabled: state.shuffleEnabled,
+            volume: state.volume,
+            miniOverlayTheme: state.miniOverlayTheme,
+            sliderStyle: state.sliderStyle,
+            themeSeedColor: state.themeSeedColor,
+            darkMode: state.darkMode,
+            pureBlack: state.pureBlack,
+            themeSurfaceStyle: state.themeSurfaceStyle,
             activeLyricLine,
-            lyricsLanguage: settings.lyricsLanguage,
+            lyricsLanguage: state.lyricsLanguage,
+            hasAlternateLanguage,
+            hasSyncedLyrics,
           },
         });
       } else if (e.data?.type === 'CMD') {
-        if (e.data.action === 'toggle') void togglePlayPause();
-        if (e.data.action === 'next') void nextTrack();
-        if (e.data.action === 'prev') void prevTrack();
+        if (e.data.action === 'toggle') void state.togglePlayPause();
+        if (e.data.action === 'next') void state.nextTrack();
+        if (e.data.action === 'prev') void state.prevTrack();
+        if (e.data.action === 'toggleLyricsLanguage') void state.toggleLyricsLanguage();
         if (e.data.action === 'seek' && typeof e.data.positionSec === 'number') {
-          seekTo(e.data.positionSec);
+          state.seekTo(e.data.positionSec);
         }
-        if (e.data.action === 'shuffle') void toggleShuffle();
-        if (e.data.action === 'repeat') void cycleRepeatMode();
+        if (e.data.action === 'shuffle') void state.toggleShuffle();
+        if (e.data.action === 'repeat') void state.cycleRepeatMode();
         if (e.data.action === 'volume' && typeof e.data.volume === 'number') {
-          updateSettings({ volume: e.data.volume });
+          state.updateSettings({ volume: e.data.volume });
         }
-        if (e.data.action === 'like' && currentTrack) {
-          void toggleLike(currentTrack.id, currentTrack);
+        if (e.data.action === 'like' && state.currentTrack) {
+          void state.toggleLike(state.currentTrack.id, state.currentTrack);
         }
         if (e.data.action === 'lyrics') {
-          void closeMiniPlayer(false);
-          toggleRightPanel('lyrics');
-        }
-        if (e.data.action === 'toggleLyricsLanguage') {
-          toggleLyricsLanguage();
+          void state.closeMiniPlayer(false);
+          state.toggleRightPanel('lyrics');
         }
         if (e.data.action === 'open-cinema') {
-          closeMiniPlayer(true);
+          state.closeMiniPlayer(true);
         }
       }
     };
     return () => ch.close();
-  }, [
-    closeMiniPlayer,
-    currentTrack,
-    durationSec,
-    isPlaying,
-    nextTrack,
-    positionSec,
-    prevTrack,
-    repeatMode,
-    seekTo,
-    shuffleEnabled,
-    settings.darkMode,
-    settings.miniOverlayTheme,
-    settings.sliderStyle,
-    settings.themeColor,
-    settings.themeSurfaceStyle,
-    settings.volume,
-    settings.lyricsLanguage,
-    togglePlayPause,
-    toggleRightPanel,
-    toggleLyricsLanguage,
-    updateSettings,
-  ]);
+  }, []);
 
   useEffect(() => {
     const api = getElectronBridge();
@@ -2994,35 +4120,70 @@ const playTrack = useCallback(
   }, [nextTrack, prevTrack, togglePlayPause]);
 
   const resetAllUserData = useCallback(async () => {
+    if (isResettingRef.current) return;
+    isResettingRef.current = true;
+    accountMutationVersionRef.current += 1;
+    accountEpochRef.current += 1;
+    librarySyncRequestIdRef.current += 1;
+    queueNextRequestIdRef.current += 1;
+
     try {
-      await clearAllLocalDatabase();
-    } catch {
-      // ignore
+      // Credentials are reset first. If browser-session cleanup fails, local
+      // data is left untouched so the user can retry safely.
+      const authResult = await ytmClient.resetYtmAuth();
+      if (!authResult.ok) {
+        throw new Error(authResult.error || 'Could not sign out of YouTube Music.');
+      }
+
+      await waitForPendingLibraryWrites();
+      try {
+        await clearAllLocalDatabase();
+      } catch (err) {
+        throw new Error(
+          `YouTube Music was signed out, but local data could not be cleared completely: ${
+            err instanceof Error ? err.message : 'IndexedDB reset failed.'
+          }`,
+        );
+      }
+      try {
+        localStorage.clear();
+        sessionStorage.clear();
+      } catch {
+        // ignore
+      }
+      pendingPersistedLibraryRef.current = null;
+      pendingPersistedQueueRef.current = null;
+      ytAuthStatusRef.current = null;
+      setYtAuthStatus(null);
+      setYtAuthVerified(false);
+      setTracks([]);
+      setPlaylists(DEFAULT_PLAYLISTS);
+      setTags(DEFAULT_TAGS);
+      setPlayEvents([]);
+      setSearchHistory([]);
+      setPlugins([]);
+      setYtSavedAlbums([]);
+      setYtFollowedArtists([]);
+      setYtUploadedTracks([]);
+      setYtHistoryTracks([]);
+      queueRef.current = [];
+      queueIndexRef.current = 0;
+      currentTrackRef.current = null;
+      setQueue([]);
+      setQueueIndex(0);
+      setCurrentTrack(null);
+      audioEngine.pause();
+      setIsPlaying(false);
+      setPositionSec(0);
+      setDurationSec(0);
+      setSpotifyConnection(null);
+      commitLikedTrackSets([], []);
+      window.location.reload();
+    } catch (err) {
+      isResettingRef.current = false;
+      throw err;
     }
-    try {
-      localStorage.clear();
-      sessionStorage.clear();
-    } catch {
-      // ignore
-    }
-    const api = getElectronBridge();
-    if (api?.auth?.ytmLogout) {
-      await api.auth.ytmLogout().catch(() => null);
-    }
-    setTracks([]);
-    setPlaylists(DEFAULT_PLAYLISTS);
-    setTags(DEFAULT_TAGS);
-    setPlayEvents([]);
-    setSearchHistory([]);
-    setPlugins([]);
-    setYtSavedAlbums([]);
-    setYtFollowedArtists([]);
-    setYtUploadedTracks([]);
-    setYtHistoryTracks([]);
-    setQueue([]);
-    setSpotifyConnection(null);
-    window.location.reload();
-  }, []);
+  }, [commitLikedTrackSets]);
 
   const value: RiriPlayerContextValue = {
     route: currentView.route,
@@ -3062,8 +4223,13 @@ const playTrack = useCallback(
     ytAccounts,
     activeYtAccount,
     signingInYtMusic,
+    ytAccountMutationPending,
     ytLoginError,
+    ytLoginRetryable,
+    ytLoginBlocked,
     clearYtLoginError,
+    retryYtMusicSignIn,
+    resetYtVault,
     ytSavedAlbums,
     ytFollowedArtists,
     ytUploadedTracks,
@@ -3173,6 +4339,7 @@ const playTrack = useCallback(
     recordSearchQuery,
     clearSearchHistory,
     updateSettings,
+    effectiveThemeColor,
 
     selectEqProfile,
     updateEqBand,

@@ -96,7 +96,11 @@ export const LibraryScreen: React.FC = () => {
     signOutYtAccount,
     signInWithYouTubeMusic,
     signingInYtMusic,
+    ytAccountMutationPending,
     ytLoginError,
+    ytLoginRetryable,
+    ytLoginBlocked,
+    retryYtMusicSignIn,
     ytSavedAlbums,
     ytFollowedArtists,
     ytUploadedTracks,
@@ -114,6 +118,7 @@ export const LibraryScreen: React.FC = () => {
   const [syncing, setSyncing] = useState(false);
   const [playlistSourceFilter, setPlaylistSourceFilter] = useState<PlaylistSourceFilter>('ALL');
   const [playlistCovers, setPlaylistCovers] = useState<Record<string, string>>({});
+  const ytAccountMutationBusy = signingInYtMusic || ytAccountMutationPending;
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const localTracks = useMemo(
@@ -425,8 +430,9 @@ export const LibraryScreen: React.FC = () => {
                   </button>
                   <button
                     type="button"
+                    disabled={ytAccountMutationPending}
                     onClick={() => void signOutYtAccount(activeYtAccount.id)}
-                    className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold bg-red-500/15 text-red-400 hover:bg-red-500/25 whitespace-nowrap cursor-pointer"
+                    className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold bg-red-500/15 text-red-400 hover:bg-red-500/25 whitespace-nowrap cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
                   >
                     <LogOut className="w-3.5 h-3.5" />
                     <span>Sign out</span>
@@ -436,7 +442,7 @@ export const LibraryScreen: React.FC = () => {
                 <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="button"
-                    disabled={signingInYtMusic}
+                    disabled={ytAccountMutationBusy}
                     onClick={() => void signInWithYouTubeMusic()}
                     className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold bg-[var(--md-primary)] text-[var(--md-on-primary)] whitespace-nowrap cursor-pointer disabled:opacity-50"
                   >
@@ -451,21 +457,33 @@ export const LibraryScreen: React.FC = () => {
                         : 'Sign in to YouTube Music'}
                     </span>
                   </button>
-                  {ytLoginError && (
-                    <button
-                      type="button"
-                      disabled={signingInYtMusic}
-                      onClick={() => void signInWithYouTubeMusic({ cleanPartition: true })}
-                      className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold bg-[var(--md-surface-container-high)] hover:bg-[var(--md-surface-container-highest)] whitespace-nowrap cursor-pointer disabled:opacity-50"
-                    >
-                      <RotateCcw className="w-3.5 h-3.5 text-[var(--md-primary)]" />
-                      <span>Try again</span>
-                    </button>
+                  {ytLoginError && !ytLoginBlocked && (
+                      <button
+                        type="button"
+                        disabled={ytAccountMutationBusy}
+                        onClick={() => {
+                          if (ytLoginRetryable) {
+                            void retryYtMusicSignIn();
+                          } else {
+                            void signInWithYouTubeMusic({ cleanPartition: true });
+                          }
+                        }}
+                        className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold bg-[var(--md-surface-container-high)] hover:bg-[var(--md-surface-container-highest)] whitespace-nowrap cursor-pointer disabled:opacity-50"
+                      >
+                        <RotateCcw className="w-3.5 h-3.5 text-[var(--md-primary)]" />
+                        <span>{ytLoginRetryable ? 'Try again' : 'Sign in again'}</span>
+                      </button>
                   )}
                 </div>
               )}
             </div>
           </div>
+
+          {ytLoginError && (
+            <div className="rounded-xl border border-red-400/30 bg-red-500/10 p-3 text-xs text-red-300">
+              {ytLoginError}
+            </div>
+          )}
 
           {ytCloudPlaylists.length > 0 && (
             <section className="space-y-3">

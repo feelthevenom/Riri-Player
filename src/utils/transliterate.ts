@@ -114,17 +114,18 @@ const HANGUL_MAP: [string, string][] = [
  * Detects if a string contains non-Latin characters
  */
 export function hasNonLatinScript(text: string): boolean {
-  return /[^\u0000-\u007F]/.test(text);
+  if (!text) return false;
+  // Checks for characters beyond basic Latin and extended Latin
+  return /[^\u0000-\u024F\u2000-\u206F\s\d.,!?'"()[\]{}:;\\/<>@#$%^&*~`_+=|-]/.test(text);
 }
 
 /**
  * Detects which script is predominantly used in the text
  */
 export function detectScript(text: string): string {
-  const chars = text.replace(/[^\u0000-\u007F]/g, '');
-  if (!chars) return 'latin';
+  if (!text) return 'latin';
 
-  let counts: Record<string, number> = {
+  const counts: Record<string, number> = {
     devanagari: 0,
     cyrillic: 0,
     arabic: 0,
@@ -135,8 +136,14 @@ export function detectScript(text: string): string {
     latin: 0,
   };
 
-  for (const char of chars) {
-    const code = char.charCodeAt(0);
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code <= 0x007F) {
+      if ((code >= 65 && code <= 90) || (code >= 97 && code <= 122)) {
+        counts.latin++;
+      }
+      continue;
+    }
     if (code >= 0x0900 && code <= 0x097F) counts.devanagari++;
     else if (code >= 0x0400 && code <= 0x04FF) counts.cyrillic++;
     else if (code >= 0x0600 && code <= 0x06FF) counts.arabic++;
@@ -144,13 +151,22 @@ export function detectScript(text: string): string {
     else if (code >= 0xAC00 && code <= 0xD7AF) counts.korean++;
     else if (code >= 0x3040 && code <= 0x30FF) counts.japanese++;
     else if (code >= 0x0370 && code <= 0x03FF) counts.greek++;
-    else counts.latin++;
   }
 
-  const entries = Object.entries(counts) as [string, number][];
-  entries.sort((a, b) => b[1] - a[1]);
-  const maxScript = entries[0][0] as string;
-  return counts[maxScript] > 0 ? maxScript : 'latin';
+  const nonLatinTotal =
+    counts.devanagari +
+    counts.cyrillic +
+    counts.arabic +
+    counts.chinese +
+    counts.korean +
+    counts.japanese +
+    counts.greek;
+
+  if (nonLatinTotal === 0) return 'latin';
+
+  const nonLatinEntries = Object.entries(counts).filter(([k]) => k !== 'latin') as [string, number][];
+  nonLatinEntries.sort((a, b) => b[1] - a[1]);
+  return nonLatinEntries[0][0];
 }
 
 /**

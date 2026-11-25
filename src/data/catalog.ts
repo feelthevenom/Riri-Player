@@ -1,6 +1,7 @@
 import {
   AppSettings,
   EqProfile,
+  LyricsProviderInfo,
   MiniOverlayTheme,
   MoodGenreTile,
   Playlist,
@@ -339,6 +340,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   translationLanguage: 'ENGLISH',
   lyricsFontScale: 1.0,
   lyricsLanguage: 'NATIVE',
+  lyricsProviders: ['lrclib', 'youlyplus', 'kugou', 'ytm'],
   pauseSearchHistory: false,
   pauseListenHistory: false,
   ytMusicEnabled: true,
@@ -353,6 +355,39 @@ export const DEFAULT_SETTINGS: AppSettings = {
   lastFmApiKey: '',
   listenBrainzToken: '',
 };
+
+export const LYRICS_PROVIDERS_CATALOG: LyricsProviderInfo[] = [
+  {
+    id: 'lrclib',
+    name: 'LRCLIB',
+    description: 'Open, crowdsourced synchronized LRC database (Free & Fast)',
+    supportsSynced: true,
+  },
+  {
+    id: 'youlyplus',
+    name: 'YouLy+',
+    description: 'High-precision word & line synchronized lyrics proxy (ArchiveTune)',
+    supportsSynced: true,
+  },
+  {
+    id: 'kugou',
+    name: 'KuGou Music',
+    description: 'Massive Asian (C-Pop/J-Pop/K-Pop) & international synchronized LRC library',
+    supportsSynced: true,
+  },
+  {
+    id: 'simpmusic',
+    name: 'SimpMusic',
+    description: 'Crowd-sourced synchronized lyrics indexed by YouTube Video ID',
+    supportsSynced: true,
+  },
+  {
+    id: 'ytm',
+    name: 'YouTube Music',
+    description: 'Official YouTube Music plain lyrics fallback',
+    supportsSynced: false,
+  },
+];
 
 export const FALLBACK_ARTWORK_DATA_URL =
   'data:image/svg+xml;utf8,' +

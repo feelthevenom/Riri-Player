@@ -1,3 +1,12 @@
+/**
+ * Mini-Player Overlay Component
+ * Implements ArchiveTune-style mini-player with:
+ * - Compact layout (468x192)
+ * - Multiple theme support including RIRI_GLASS with album palette colors
+ * - Lyrics toggle with English/Native option (always clickable)
+ * - Always-clickable controls
+ */
+
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Heart,
@@ -32,6 +41,8 @@ import {
   applyMaterialTheme,
   buildAlbumGradientTheme,
   extractPaletteFromArtwork,
+  luminance,
+  mixHex,
 } from '../utils/themeEngine';
 
 interface MiniPlayerCardProps {
@@ -43,6 +54,9 @@ interface MiniPlayerCardProps {
   sliderStyle?: SliderStyle;
   themeSeedColor: string;
   activeLyricLine?: string | null;
+  activeLyricIdx?: number;
+  hasAlternateLanguage?: boolean;
+  hasSyncedLyrics?: boolean;
   liked: boolean;
   repeatMode: 'OFF' | 'ALL' | 'ONE';
   shuffleEnabled: boolean;
@@ -75,6 +89,9 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
   sliderStyle = 'DEFAULT',
   themeSeedColor,
   activeLyricLine,
+  activeLyricIdx,
+  hasAlternateLanguage = false,
+  hasSyncedLyrics = true,
   liked = false,
   repeatMode = 'OFF',
   shuffleEnabled = false,
@@ -119,11 +136,7 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
 
   // Extract artwork palette for Dynamic Accent, Glass, and Riri Glass themes
   useEffect(() => {
-    if (
-      !isDynamicAccent &&
-      !isGlassTheme &&
-      miniOverlayTheme !== 'RIRI_GLASS'
-    ) {
+    if (!isDynamicAccent && !isGlassTheme && miniOverlayTheme !== 'RIRI_GLASS') {
       setArtworkPalette(null);
       return;
     }
@@ -183,7 +196,12 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
         ? 'text-white/75'
         : 'text-[var(--md-on-surface-variant)]';
 
-  const accentColor = dynamicTheme ? dynamicTheme.primary : 'var(--md-primary)';
+  const baseThemeColor = themeSeedColor || '#ED5564';
+  const materialAccentColor = isLightTheme
+    ? mixHex(baseThemeColor, '#000000', 0.12)
+    : mixHex(baseThemeColor, '#FFFFFF', 0.22);
+  const accentColor = dynamicTheme ? dynamicTheme.primary : materialAccentColor;
+  const accentOnPrimary = luminance(accentColor) > 0.48 ? '#1A0B0E' : '#FFFFFF';
 
   // Parse hex color to RGB components for CSS variable usage
   const hexToRgb = (hex: string): { r: number; g: number; b: number } => {
@@ -202,10 +220,12 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
   const primaryRgb = hexToRgb(palettePrimary);
   const secondaryRgb = hexToRgb(paletteSecondary);
 
+  // Keep every mini-player action on the same accent as the active overlay theme.
+  // Riri Glass is album-palette driven; the other themes use the app's Material accent.
+  const themeAccentColor =
+    miniOverlayTheme === 'RIRI_GLASS' ? palettePrimary : accentColor;
+
   const cardStyle: React.CSSProperties = {
-    ...(dragRegion
-      ? ({ WebkitAppRegion: isLocked ? 'no-drag' : 'drag' } as React.CSSProperties)
-      : {}),
     ...(miniOverlayTheme === 'RIRI_GLASS'
       ? {
           '--riri-glass-primary-r': primaryRgb.r,
@@ -215,6 +235,8 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
           '--riri-glass-secondary-g': secondaryRgb.g,
           '--riri-glass-secondary-b': secondaryRgb.b,
           borderColor: `rgba(${primaryRgb.r}, ${primaryRgb.g}, ${primaryRgb.b}, 0.35)`,
+          borderWidth: 0,
+          borderRadius: 28,
         }
       : {}),
     ...(isGlassTheme
@@ -236,9 +258,23 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
       : {}),
   };
 
-  const noDrag = dragRegion
+  // Only the title is a drag handle. Keeping the card itself outside a drag
+  // region prevents Chromium/Electron from swallowing clicks on its controls.
+  const dragHandleStyle: React.CSSProperties | undefined =
+    dragRegion && !isLocked
+      ? ({ WebkitAppRegion: 'drag' } as React.CSSProperties)
+      : undefined;
+
+  // Every interactive element is explicitly no-drag, including controls that
+  // are not nested inside the small drag handle.
+  const interactiveNoDrag = dragRegion
     ? ({ WebkitAppRegion: 'no-drag' } as React.CSSProperties)
     : undefined;
+
+  const themedControlStyle: React.CSSProperties = {
+    ...(interactiveNoDrag || {}),
+    color: themeAccentColor,
+  };
 
   const playButtonStyle: React.CSSProperties = dynamicTheme
     ? {
@@ -246,9 +282,22 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
         color: dynamicTheme.onPrimary || '#ffffff',
         boxShadow: `0 6px 18px -2px ${dynamicTheme.primary}85`,
       }
-    : {
-        boxShadow: '0 6px 18px -2px color-mix(in srgb, var(--md-primary) 50%, transparent)',
-      };
+    : miniOverlayTheme === 'RIRI_GLASS'
+      ? {
+          background: `linear-gradient(135deg, ${palettePrimary}, ${paletteSecondary})`,
+          color: '#ffffff',
+          boxShadow: `0 0 22px rgba(${primaryRgb.r}, ${primaryRgb.g}, ${primaryRgb.b}, 0.65), inset 0 1px 0 rgba(255, 255, 255, 0.4)`,
+        }
+      : {
+          backgroundColor: accentColor,
+          color: accentOnPrimary,
+          boxShadow: `0 6px 18px -2px ${accentColor}80`,
+        };
+
+  const playButtonMergedStyle: React.CSSProperties = {
+    ...(interactiveNoDrag || {}),
+    ...playButtonStyle,
+  };
 
   const handleToggleMute = () => {
     if (isMuted || displayVolume === 0) {
@@ -270,9 +319,11 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
       style={cardStyle}
       className={`relative ${
         fullWindow
-          ? 'w-screen h-screen rounded-[22px]'
-          : 'w-[468px] max-w-[calc(100vw-24px)] rounded-[20px]'
-      } select-none overflow-hidden p-2.5 py-2 flex flex-col justify-between gap-1.5 ${containerClass}`}
+          ? 'w-screen h-screen rounded-[28px]'
+          : miniOverlayTheme === 'RIRI_GLASS'
+            ? 'w-[468px] max-w-[calc(100vw-24px)] rounded-[28px]'
+            : 'w-[468px] max-w-[calc(100vw-24px)] rounded-[20px]'
+      } overflow-hidden p-2.5 py-2 flex flex-col justify-between gap-1.5 ${containerClass}`}
     >
       {/* RIRI_GLASS: corner glow layers (coral bottom-left, periwinkle right) */}
       {miniOverlayTheme === 'RIRI_GLASS' && (
@@ -294,16 +345,12 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
           <div
             aria-hidden="true"
             className="pointer-events-none absolute -top-8 -left-8 w-40 h-40 rounded-full opacity-25 blur-2xl"
-            style={{
-              backgroundColor: artworkPalette?.primary || themeSeedColor || '#ED5564',
-            }}
+            style={{ backgroundColor: artworkPalette?.primary || themeSeedColor || '#ED5564' }}
           />
           <div
             aria-hidden="true"
             className="pointer-events-none absolute -bottom-10 -right-6 w-48 h-40 rounded-full opacity-20 blur-2xl"
-            style={{
-              backgroundColor: artworkPalette?.secondary || '#3b82f6',
-            }}
+            style={{ backgroundColor: artworkPalette?.secondary || '#3b82f6' }}
           />
           <div
             aria-hidden="true"
@@ -318,7 +365,12 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
 
       {/* Header: Compact Title Bar */}
       <div className="relative z-10 flex items-center justify-between gap-1.5 pb-1 border-b border-white/[0.10]">
-        <div className="flex items-center gap-1.5 min-w-0">
+        <div
+          style={dragHandleStyle}
+          className={`flex flex-1 items-center gap-1.5 min-w-0 ${
+            dragRegion && !isLocked ? 'cursor-grab active:cursor-grabbing' : ''
+          }`}
+        >
           <span
             style={
               dynamicTheme
@@ -328,8 +380,8 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
                   }
                 : miniOverlayTheme === 'RIRI_GLASS'
                   ? {
-                      background: `linear-gradient(135deg, ${artworkPalette?.primary ?? '#ED5564'}, ${artworkPalette?.secondary ?? '#ED2F5B'})`,
-                      boxShadow: `0 0 14px rgba(${artworkPalette?.primary ?? '#ED5564'}, 0.55)`,
+                      background: `linear-gradient(135deg, ${palettePrimary}, ${paletteSecondary})`,
+                      boxShadow: `0 0 14px rgba(${primaryRgb.r}, ${primaryRgb.g}, ${primaryRgb.b}, 0.55)`,
                       color: '#ffffff',
                     }
                   : undefined
@@ -347,15 +399,14 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
           </span>
         </div>
 
-        <div style={noDrag} className="flex items-center gap-0.5 shrink-0">
+        <div className="flex items-center gap-0.5 shrink-0">
           <button
             type="button"
+            style={themedControlStyle}
             onClick={onToggleLock}
             aria-label={isLocked ? 'Unpin mini-player' : 'Pin mini-player'}
             title={isLocked ? 'Unpin position' : 'Pin position'}
-            className={`p-1 rounded-md transition-colors cursor-pointer ${
-              isLocked ? 'text-[var(--md-primary)]' : `${secondaryTextClass} hover:${primaryTextClass}`
-            }`}
+            className="p-1 rounded-md transition-opacity cursor-pointer opacity-80 hover:opacity-100"
           >
             {isLocked ? (
               <PinOff className="w-3 h-3" />
@@ -363,35 +414,36 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
               <Pin className="w-3 h-3 -rotate-45" />
             )}
           </button>
-          <span
-            className={`w-px h-3 bg-white/20 self-stretch ${
-              miniOverlayTheme === 'RIRI_GLASS' ? 'bg-white/30' : ''
-            }`}
-          />
+          <span className={`w-px h-3 bg-white/20 self-stretch ${
+            miniOverlayTheme === 'RIRI_GLASS' ? 'bg-white/30' : ''
+          }`} />
           <button
             type="button"
+            style={themedControlStyle}
             onClick={onOpenCinemaView}
             aria-label="Expand mini-player"
             title="Expand"
-            className={`p-1 rounded-md transition-colors cursor-pointer ${secondaryTextClass}`}
+            className="p-1 rounded-md transition-opacity cursor-pointer opacity-80 hover:opacity-100"
           >
             <Maximize2 className="w-3 h-3" />
           </button>
           <button
             type="button"
+            style={themedControlStyle}
             onClick={onMinimize}
             aria-label="Minimize mini-player"
             title="Minimize"
-            className={`p-1 rounded-md transition-colors cursor-pointer ${secondaryTextClass}`}
+            className="p-1 rounded-md transition-opacity cursor-pointer opacity-80 hover:opacity-100"
           >
             <Minus className="w-3 h-3" />
           </button>
           <button
             type="button"
+            style={themedControlStyle}
             onClick={onClose}
             aria-label="Open Riri Player"
             title="Open Riri Player"
-            className={`p-1 rounded-md hover:bg-red-500/20 hover:text-red-300 transition-colors cursor-pointer ${secondaryTextClass}`}
+            className="p-1 rounded-md hover:bg-red-500/20 transition-colors cursor-pointer opacity-80 hover:opacity-100"
           >
             <X className="w-3 h-3" />
           </button>
@@ -417,6 +469,7 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
             />
             <button
               type="button"
+              style={interactiveNoDrag}
               onClick={onOpenCinemaView}
               aria-label="Expand"
               title="Expand"
@@ -432,12 +485,10 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
               </span>
               <button
                 type="button"
-                style={noDrag}
+                style={themedControlStyle}
                 onClick={onToggleLike}
                 aria-label={liked ? 'Unlike' : 'Like'}
-                className={`p-1 rounded-full shrink-0 cursor-pointer transition-colors ${
-                  liked ? 'text-[var(--md-primary)]' : secondaryTextClass
-                }`}
+                className="p-1 rounded-full shrink-0 cursor-pointer transition-opacity hover:opacity-100"
               >
                 <Heart className={`w-3.5 h-3.5 ${liked ? 'fill-current' : ''}`} />
               </button>
@@ -445,7 +496,7 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
 
             {showLyrics ? (
               activeLyricLine ? (
-                <div className="text-[10px] leading-tight italic font-medium mt-0.5">
+                <div className="text-[10px] leading-tight italic font-medium mt-0.5 truncate">
                   <span
                     style={{
                       color:
@@ -458,9 +509,13 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
                     {activeLyricLine}
                   </span>
                 </div>
+              ) : hasSyncedLyrics === false ? (
+                <div className="text-[10px] leading-tight italic font-medium mt-0.5 opacity-65 truncate">
+                  Synced lyrics unavailable
+                </div>
               ) : (
-                <div className="text-[10px] leading-tight italic font-medium mt-0.5 opacity-70">
-                  Lyrics unsupported for the song
+                <div className="text-[10px] leading-tight italic font-medium mt-0.5 opacity-65 truncate">
+                  ...
                 </div>
               )
             ) : (
@@ -471,14 +526,15 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
           </div>
         </div>
 
-        <div style={noDrag} className="flex items-center gap-1 shrink-0">
+        <div className="flex items-center gap-1 shrink-0">
           <button
             type="button"
+            style={themedControlStyle}
             onClick={onToggleShuffle}
             aria-label={shuffleEnabled ? 'Disable shuffle' : 'Enable shuffle'}
             title="Shuffle"
-            className={`p-1 rounded-md transition-colors cursor-pointer opacity-70 hover:opacity-100 ${
-              shuffleEnabled ? 'text-[var(--md-primary)]' : 'text-white'
+            className={`p-1 rounded-md transition-opacity cursor-pointer hover:opacity-100 ${
+              shuffleEnabled ? 'opacity-100' : 'opacity-70'
             }`}
           >
             <Shuffle className="w-4 h-4 stroke-current" />
@@ -486,31 +542,23 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
 
           <button
             type="button"
+            style={themedControlStyle}
             onClick={onPrev}
             aria-label="Previous track"
             title="Previous"
-            className={`p-1 rounded-md transition-colors cursor-pointer opacity-70 hover:opacity-100 text-white`}
+            className="p-1 rounded-md transition-opacity cursor-pointer opacity-70 hover:opacity-100"
           >
             <SkipBack className="w-4 h-4 fill-current" />
           </button>
 
           <button
             type="button"
+            style={playButtonMergedStyle}
             onClick={onTogglePlayPause}
             aria-label={isPlaying ? 'Pause' : 'Play'}
             title={isPlaying ? 'Pause' : 'Play'}
-            style={
-              miniOverlayTheme === 'RIRI_GLASS'
-                ? {
-                    background: `linear-gradient(135deg, ${palettePrimary}, ${paletteSecondary})`,
-                    boxShadow: `0 0 22px rgba(${primaryRgb.r}, ${primaryRgb.g}, ${primaryRgb.b}, 0.65), inset 0 1px 0 rgba(255, 255, 255, 0.4)`,
-                  }
-                : playButtonStyle
-            }
             className={`rounded-full flex items-center justify-center cursor-pointer transition-transform hover:scale-105 active:scale-95 ${
-              miniOverlayTheme === 'RIRI_GLASS'
-                ? 'w-10 h-10'
-                : 'w-8 h-8 bg-[var(--md-primary)] text-[var(--md-on-primary)]'
+              miniOverlayTheme === 'RIRI_GLASS' ? 'w-10 h-10' : 'w-8 h-8'
             }`}
           >
             {isPlaying ? (
@@ -522,21 +570,23 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
 
           <button
             type="button"
+            style={themedControlStyle}
             onClick={onNext}
             aria-label="Next track"
             title="Next"
-            className={`p-1 rounded-md transition-colors cursor-pointer opacity-70 hover:opacity-100 text-white`}
+            className="p-1 rounded-md transition-opacity cursor-pointer opacity-70 hover:opacity-100"
           >
             <SkipForward className="w-4 h-4 fill-current" />
           </button>
 
           <button
             type="button"
+            style={themedControlStyle}
             onClick={onCycleRepeatMode}
             aria-label={`Repeat mode: ${repeatMode}`}
             title={`Repeat: ${repeatMode}`}
-            className={`p-1 rounded-md transition-colors cursor-pointer opacity-70 hover:opacity-100 ${
-              repeatMode === 'OFF' ? 'text-white' : 'text-[var(--md-primary)]'
+            className={`p-1 rounded-md transition-opacity cursor-pointer hover:opacity-100 ${
+              repeatMode === 'OFF' ? 'opacity-70' : 'opacity-100'
             }`}
           >
             {repeatMode === 'ONE' ? (
@@ -549,7 +599,7 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
       </div>
 
       {/* Progress / Seek Bar + Compact Timestamps */}
-      <div style={noDrag} className="relative z-10 w-full">
+      <div className="relative z-10 w-full">
         <div className="relative h-1.5 w-full">
           <div
             className="absolute inset-0 h-full rounded-full overflow-hidden pointer-events-none"
@@ -562,12 +612,13 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
               className="h-full rounded-full transition-[width] duration-75"
               style={{
                 width: `${Math.min(100, Math.max(0, (positionSec / Math.max(1, durationSec))) * 100)}%`,
-                backgroundColor: miniOverlayTheme === 'RIRI_GLASS' ? palettePrimary : accentColor,
+                backgroundColor: themeAccentColor,
               }}
             />
           </div>
           <input
             type="range"
+            style={interactiveNoDrag}
             aria-label="Mini-player seek bar"
             min={0}
             max={1}
@@ -580,26 +631,22 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
             className="absolute inset-0 w-full h-full opacity-0 cursor-pointer m-0 z-20"
           />
         </div>
-        <div
-          className={`flex items-center justify-between text-[10px] leading-none font-medium font-mono-tabular mt-1 ${secondaryTextClass}`}
-        >
+        <div className={`flex items-center justify-between text-[10px] leading-none font-medium font-mono-tabular mt-1 ${secondaryTextClass}`}>
           <span>{formatTime(positionSec)}</span>
           <span>{formatTime(durationSec)}</span>
         </div>
       </div>
 
-      {/* Bottom Action Row: Volume | Lyrics & Cinema View */}
-      <div
-        style={noDrag}
-        className="relative z-10 flex items-center justify-between gap-2 pt-0.5"
-      >
+      {/* Bottom Action Row: Volume | Lyrics */}
+      <div className="relative z-10 flex items-center justify-between gap-2 pt-0.5">
         {/* Left: Volume */}
         <div className="flex items-center gap-2">
           <button
             type="button"
+            style={themedControlStyle}
             onClick={handleToggleMute}
             aria-label={isMuted || displayVolume === 0 ? 'Unmute' : 'Mute'}
-            className={`p-1 rounded-md transition-colors cursor-pointer opacity-70 hover:opacity-100 text-white`}
+            className="p-1 rounded-md transition-opacity cursor-pointer opacity-70 hover:opacity-100"
           >
             {isMuted || displayVolume === 0 ? (
               <VolumeX className="w-3.5 h-3.5 stroke-current" />
@@ -611,26 +658,20 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
           </button>
 
           <div className="relative w-20 h-1.5 flex items-center group select-none">
-            <div
-              className={`w-full h-full rounded-full overflow-hidden pointer-events-none ${
-                miniOverlayTheme === 'RIRI_GLASS' ? 'riri-range' : 'bg-white/15'
-              }`}
-            >
+            <div className={`w-full h-full rounded-full overflow-hidden pointer-events-none ${
+              miniOverlayTheme === 'RIRI_GLASS' || miniOverlayTheme === 'DYNAMIC_ACCENT'
+                ? 'riri-range'
+                : 'bg-white/15'
+            }`}>
               <div
                 className="h-full rounded-full transition-[width] duration-75"
-                style={{
-                  width: `${displayVolume * 100}%`,
-                  backgroundColor: miniOverlayTheme === 'RIRI_GLASS' || miniOverlayTheme === 'DYNAMIC_ACCENT' ? palettePrimary : accentColor,
-                }}
+                style={{ width: `${displayVolume * 100}%`, backgroundColor: themeAccentColor }}
               />
               <span
                 className="absolute top-1/2 -translate-x-1/2 -translate-y-1/2 w-2.5 h-2.5 rounded-full opacity-0 group-hover:opacity-100 shadow transition-opacity pointer-events-none"
                 style={{
                   left: `${displayVolume * 100}%`,
-                  backgroundColor:
-                    miniOverlayTheme === 'RIRI_GLASS' || miniOverlayTheme === 'DYNAMIC_ACCENT'
-                      ? palettePrimary
-                      : accentColor,
+                  backgroundColor: themeAccentColor,
                   boxShadow:
                     miniOverlayTheme === 'RIRI_GLASS' || miniOverlayTheme === 'DYNAMIC_ACCENT'
                       ? `0 0 10px rgba(${primaryRgb.r}, ${primaryRgb.g}, ${primaryRgb.b}, 0.7)`
@@ -640,6 +681,7 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
             </div>
             <input
               type="range"
+              style={interactiveNoDrag}
               aria-label="Volume"
               min={0}
               max={1}
@@ -658,21 +700,20 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
         {/* Vertical divider */}
         <span className="w-px h-4 bg-white/20 self-stretch" />
 
-        {/* Right: Lyrics only */}
-        <div className="flex items-center gap-2">
+        {/* Right: Lyrics toggle & Language switch */}
+        <div className="flex items-center gap-1.5">
           <button
             type="button"
+            style={{
+              ...themedControlStyle,
+              backgroundColor: showLyrics
+                ? 'color-mix(in srgb, currentColor 12%, transparent)'
+                : undefined,
+            }}
             onClick={() => setShowLyrics((prev) => !prev)}
             aria-label={showLyrics ? 'Hide lyrics' : 'Show lyrics'}
-            className={`flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-medium transition-colors cursor-pointer ${
-              miniOverlayTheme === 'DYNAMIC_ACCENT' || miniOverlayTheme === 'RIRI_GLASS'
-                ? showLyrics
-                  ? 'text-[var(--md-primary)]'
-                  : 'text-white/70'
-                : showLyrics
-                  ? `text-[${palettePrimary}]`
-                  : secondaryTextClass
-            }`}
+            title={showLyrics ? 'Hide live synced lyrics' : 'Show live synced lyrics'}
+            className="flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-medium transition-opacity cursor-pointer hover:opacity-100"
           >
             {showLyrics ? (
               <Mic className={`w-3 h-3 fill-current`} />
@@ -681,24 +722,35 @@ const MiniPlayerCard: React.FC<MiniPlayerCardProps> = ({
             )}
           </button>
 
-          <button
-            type="button"
-            onClick={() => onToggleLyricsLanguage()}
-            aria-label={
-              lyricsLanguage === 'ENGLISH'
-                ? 'Switch to native lyrics'
-                : 'Switch to English lyrics'
-            }
-            className={`flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-medium transition-colors cursor-pointer ${
-              lyricsLanguage === 'ENGLISH'
-                ? miniOverlayTheme === 'DYNAMIC_ACCENT' || miniOverlayTheme === 'RIRI_GLASS'
-                  ? 'text-[var(--md-primary)]'
-                  : `text-[${palettePrimary}]`
-                : secondaryTextClass
-            }`}
-          >
-            {lyricsLanguage === 'ENGLISH' ? 'Native' : 'Eng'}
-          </button>
+          {/* English / Native Toggle: ONLY show if song has an alternate language */}
+          {hasAlternateLanguage && showLyrics && hasSyncedLyrics !== false && (
+            <button
+              type="button"
+              style={{
+                ...themedControlStyle,
+                backgroundColor:
+                  lyricsLanguage === 'ENGLISH'
+                    ? 'color-mix(in srgb, currentColor 12%, transparent)'
+                    : undefined,
+              }}
+              onClick={() => onToggleLyricsLanguage()}
+              aria-label={
+                lyricsLanguage === 'ENGLISH'
+                  ? 'Switch to native lyrics'
+                  : 'Switch to English lyrics'
+              }
+              title={
+                lyricsLanguage === 'ENGLISH'
+                  ? 'English lyrics active (Click for Native)'
+                  : 'Native lyrics active (Click for English)'
+              }
+              className={`flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-medium transition-opacity cursor-pointer hover:opacity-100 ${
+                lyricsLanguage === 'ENGLISH' ? 'font-bold' : ''
+              }`}
+            >
+              {lyricsLanguage === 'ENGLISH' ? 'Eng' : 'Native'}
+            </button>
+          )}
         </div>
       </div>
     </div>
@@ -721,6 +773,7 @@ export const MiniPlayerOverlay: React.FC = () => {
     isTrackLiked,
     toggleLike,
     settings,
+    effectiveThemeColor,
     cycleRepeatMode,
     toggleShuffle,
     repeatMode,
@@ -733,23 +786,31 @@ export const MiniPlayerOverlay: React.FC = () => {
 
   const [isLocked, setIsLocked] = useState(false);
 
-  const parsedLyrics = useMemo(
-    () => {
-      if (settings.lyricsLanguage === 'ENGLISH' && activeTrackLyrics.englishLyrics) {
-        const original = parseLrcLyrics(activeTrackLyrics.syncedLyrics);
-        return activeTrackLyrics.englishLyrics.map((text, i) => ({
-          text,
-          timeMs: original[i]?.timeMs ?? i * 1000,
-        }));
-      }
-      return parseLrcLyrics(activeTrackLyrics.syncedLyrics);
-    },
-    [
-      activeTrackLyrics.syncedLyrics,
-      activeTrackLyrics.englishLyrics,
-      settings.lyricsLanguage,
-    ],
+  const hasSyncedLyrics = Boolean(activeTrackLyrics.syncedLyrics && activeTrackLyrics.syncedLyrics.trim().length > 0);
+  const hasAlternateLanguage = Boolean(
+    activeTrackLyrics.englishLyrics && activeTrackLyrics.englishLyrics.length > 0,
   );
+
+  const parsedLyrics = useMemo(() => {
+    if (!activeTrackLyrics.syncedLyrics) return [];
+    const original = parseLrcLyrics(activeTrackLyrics.syncedLyrics);
+    if (
+      settings.lyricsLanguage === 'ENGLISH' &&
+      activeTrackLyrics.englishLyrics &&
+      activeTrackLyrics.englishLyrics.length > 0
+    ) {
+      return activeTrackLyrics.englishLyrics.map((text, i) => ({
+        text,
+        timeMs: original[i]?.timeMs ?? i * 1000,
+      }));
+    }
+    return original;
+  }, [
+    activeTrackLyrics.syncedLyrics,
+    activeTrackLyrics.englishLyrics,
+    settings.lyricsLanguage,
+  ]);
+
   const activeLyricIdx = useMemo(
     () => findActiveLyricIndex(parsedLyrics, positionSec * 1000, settings.lyricsOffsetMs),
     [parsedLyrics, positionSec, settings.lyricsOffsetMs],
@@ -778,8 +839,11 @@ export const MiniPlayerOverlay: React.FC = () => {
         durationSec={durationSec}
         miniOverlayTheme={settings.miniOverlayTheme}
         sliderStyle={settings.sliderStyle}
-        themeSeedColor={settings.themeColor}
+        themeSeedColor={effectiveThemeColor}
         activeLyricLine={activeLyricLine}
+        activeLyricIdx={activeLyricIdx}
+        hasAlternateLanguage={hasAlternateLanguage}
+        hasSyncedLyrics={hasSyncedLyrics}
         liked={liked}
         repeatMode={repeatMode}
         shuffleEnabled={shuffleEnabled}
@@ -817,6 +881,7 @@ export const StandaloneMiniOverlayWindow: React.FC = () => {
     sliderStyle?: SliderStyle;
     themeSeedColor?: string;
     darkMode?: 'DARK' | 'LIGHT' | 'SYSTEM';
+    pureBlack?: boolean;
     themeSurfaceStyle?: ThemeSurfaceStyle;
     repeatMode?: 'OFF' | 'ALL' | 'ONE';
     shuffleEnabled?: boolean;
@@ -824,6 +889,8 @@ export const StandaloneMiniOverlayWindow: React.FC = () => {
     liked?: boolean;
     activeLyricLine?: string | null;
     lyricsLanguage?: 'NATIVE' | 'ENGLISH';
+    hasAlternateLanguage?: boolean;
+    hasSyncedLyrics?: boolean;
   }>({
     currentTrack: null,
     isPlaying: false,
@@ -833,6 +900,7 @@ export const StandaloneMiniOverlayWindow: React.FC = () => {
     sliderStyle: 'DEFAULT',
     themeSeedColor: '#ed5564',
     darkMode: 'DARK',
+    pureBlack: false,
     themeSurfaceStyle: 'GLASS',
     repeatMode: 'OFF',
     shuffleEnabled: false,
@@ -840,10 +908,14 @@ export const StandaloneMiniOverlayWindow: React.FC = () => {
     liked: false,
     activeLyricLine: null,
     lyricsLanguage: 'NATIVE',
+    hasAlternateLanguage: false,
+    hasSyncedLyrics: true,
   });
 
   const stateRef = useRef(state);
   stateRef.current = state;
+  const overlayChannelRef = useRef<BroadcastChannel | null>(null);
+  const appliedThemeRef = useRef('');
 
   const [isLocked, setIsLocked] = useState<boolean>(() => {
     try {
@@ -879,6 +951,7 @@ export const StandaloneMiniOverlayWindow: React.FC = () => {
   useEffect(() => {
     if (typeof BroadcastChannel === 'undefined') return;
     const ch = new BroadcastChannel('riri_mini_overlay');
+    overlayChannelRef.current = ch;
     ch.onmessage = (
       e: MessageEvent<{
         type?: string;
@@ -895,12 +968,22 @@ export const StandaloneMiniOverlayWindow: React.FC = () => {
           setLocalVolume(p.volume);
         }
         if (p.themeSeedColor) {
-          applyMaterialTheme(
+          const overlayDarkMode = p.miniOverlayTheme === 'LIGHT' ? 'LIGHT' : 'DARK';
+          const themeKey = [
             p.themeSeedColor,
-            p.darkMode || 'DARK',
-            false,
+            overlayDarkMode,
+            p.pureBlack ? 'pure-black' : 'standard',
             p.themeSurfaceStyle || 'GLASS',
-          );
+          ].join('|');
+          if (themeKey !== appliedThemeRef.current) {
+            applyMaterialTheme(
+              p.themeSeedColor,
+              overlayDarkMode,
+              Boolean(p.pureBlack),
+              p.themeSurfaceStyle || 'GLASS',
+            );
+            appliedThemeRef.current = themeKey;
+          }
         }
       } else if (e.data?.type === 'REQUEST_STATE') {
         const current = stateRef.current;
@@ -915,23 +998,32 @@ export const StandaloneMiniOverlayWindow: React.FC = () => {
             sliderStyle: current.sliderStyle,
             themeSeedColor: current.themeSeedColor,
             darkMode: current.darkMode,
+            pureBlack: current.pureBlack,
             themeSurfaceStyle: current.themeSurfaceStyle,
+            repeatMode: current.repeatMode,
+            shuffleEnabled: current.shuffleEnabled,
+            volume: current.volume,
+            liked: current.liked,
+            activeLyricLine: current.activeLyricLine,
+            lyricsLanguage: current.lyricsLanguage,
+            hasAlternateLanguage: current.hasAlternateLanguage,
+            hasSyncedLyrics: current.hasSyncedLyrics,
           },
         });
       }
     };
     ch.postMessage({ type: 'REQUEST_STATE' });
-    return () => ch.close();
+    return () => {
+      if (overlayChannelRef.current === ch) overlayChannelRef.current = null;
+      ch.close();
+    };
   }, []);
 
   const sendCmd = (
     action: string,
     payload?: { positionSec?: number; volume?: number },
   ) => {
-    if (typeof BroadcastChannel === 'undefined') return;
-    const ch = new BroadcastChannel('riri_mini_overlay');
-    ch.postMessage({ type: 'CMD', action, ...payload });
-    ch.close();
+    overlayChannelRef.current?.postMessage({ type: 'CMD', action, ...payload });
   };
 
   const sendSeek = (positionSec: number) => {
@@ -966,9 +1058,6 @@ export const StandaloneMiniOverlayWindow: React.FC = () => {
   };
 
   const handleReturnToApp = (openCinema: boolean) => {
-    if (openCinema) {
-      sendCmd('open-cinema');
-    }
     const electronApi = (
       window as unknown as {
         electronAPI?: {
@@ -996,6 +1085,8 @@ export const StandaloneMiniOverlayWindow: React.FC = () => {
       sliderStyle={state.sliderStyle || 'DEFAULT'}
       themeSeedColor={state.themeSeedColor || '#ed5564'}
       activeLyricLine={state.activeLyricLine}
+      hasAlternateLanguage={state.hasAlternateLanguage}
+      hasSyncedLyrics={state.hasSyncedLyrics}
       liked={state.liked ?? false}
       repeatMode={state.repeatMode ?? 'OFF'}
       shuffleEnabled={state.shuffleEnabled ?? false}
@@ -1020,3 +1111,5 @@ export const StandaloneMiniOverlayWindow: React.FC = () => {
     />
   );
 };
+
+export default MiniPlayerCard;

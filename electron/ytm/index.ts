@@ -3,15 +3,23 @@ import {
   attachCleanChromeHeaders,
   closeCurrentAuthWin,
   configureElectronYtmCookieRefresh,
-  getYtmAuthStatus,
   importYtmSessionFallback,
   loginYouTubeMusicWindow,
   logoutYtmAccount,
+  resetYtmAuth,
+  restoreYtmAccountFromSession,
   switchYtmAccount,
   YTM_PARTITION,
 } from './auth';
 import { configureBotGuardWindowFactory } from './botguard';
-import { configureCredentialStorage, getVaultDiagnostic, invalidateVaultCache, updateSpotifyCredentials } from './credentials';
+import {
+  configureCredentialStorage,
+  getActiveYtAccount,
+  getVaultDiagnostic,
+  invalidateVaultCache,
+  resetYtVaultWithBackup,
+  updateSpotifyCredentials,
+} from './credentials';
 import {
   browseYtmCollection,
   fetchExploreCharts,
@@ -41,6 +49,30 @@ import type {
   ElectronSessionModuleLike,
 } from './electronTypes';
 
+function toYtmErrorPayload(error: unknown): {
+  ok: false;
+  error: string;
+  code: string;
+  retryable: boolean;
+} {
+  const candidate = error as { code?: unknown; retryable?: unknown } | null;
+  const message =
+    error instanceof Error && error.message
+      ? error.message
+      : 'YouTube Music authentication failed.';
+  return {
+    ok: false,
+    error: message,
+    code:
+      typeof candidate?.code === 'string' && candidate.code
+        ? candidate.code
+        : error instanceof Error && error.name
+          ? error.name
+          : 'YtmAuthError',
+    retryable: candidate?.retryable === true,
+  };
+}
+
 export interface RegisterYtmIpcParams {
   app: ElectronAppLike;
   BrowserWindow: ElectronBrowserWindowConstructorLike;
@@ -58,11 +90,15 @@ export function registerYtmIpcHandlers(params: RegisterYtmIpcParams): void {
     safeStorage,
   });
 
-  configureElectronYtmCookieRefresh(() => session.fromPartition(YTM_PARTITION));
+  configureElectronYtmCookieRefresh((account) =>
+    session.fromPartition(account.partitionName?.trim() || YTM_PARTITION),
+  );
 
   configureBotGuardWindowFactory({
     createHiddenWindow: async (url: string) => {
-      const ses = session.fromPartition(YTM_PARTITION);
+      const active = await getActiveYtAccount();
+      const partitionName = active?.partitionName?.trim() || YTM_PARTITION;
+      const ses = session.fromPartition(partitionName);
       attachCleanChromeHeaders(ses);
       const win = new BrowserWindow({
         show: false,
@@ -72,7 +108,7 @@ export function registerYtmIpcHandlers(params: RegisterYtmIpcParams): void {
           contextIsolation: true,
           nodeIntegration: false,
           sandbox: true,
-          partition: YTM_PARTITION,
+          partition: partitionName,
         },
       });
       try {
@@ -108,24 +144,51 @@ export function registerYtmIpcHandlers(params: RegisterYtmIpcParams): void {
   );
 
   // ── Auth IPC (YTM + Spotify) ─────────────────────────────────────────────
-  ipcMain.handle('auth:ytm:status', () => getYtmAuthStatus());
+  ipcMain.handle('auth:ytm:status', async () => {
+    // The persistent Electron partition remains signed in even if the
+    // encrypted vault was lost. Recover the account before reporting status
+    // so Home and Library use real authenticated credentials.
+    return await restoreYtmAccountFromSession(session);
+  });
 
   ipcMain.handle('auth:ytm:vault-diagnostic', () => getVaultDiagnostic());
 
-  ipcMain.handle('auth:ytm:invalidate-vault-cache', () => {
-    invalidateVaultCache();
+  ipcMain.handle('auth:ytm:invalidate-vault-cache', async () => {
+    await invalidateVaultCache();
     return { ok: true };
+  });
+
+  ipcMain.handle('auth:ytm:reset-vault', async () => {
+    try {
+      const result = await resetYtVaultWithBackup();
+      return { ok: true, ...result };
+    } catch (error) {
+      return toYtmErrorPayload(error);
+    }
+  });
+
+  ipcMain.handle('auth:ytm:reset', async () => {
+    try {
+      const status = await resetYtmAuth(session);
+      return { ok: true, status };
+    } catch (error) {
+      return toYtmErrorPayload(error);
+    }
   });
 
   ipcMain.handle(
     'auth:ytm:login',
     async (_ev, payload?: { cleanPartition?: boolean }) => {
-      return await loginYouTubeMusicWindow({
-        BrowserWindow,
-        session,
-        parentWindow: getMainWindow(),
-        cleanPartition: Boolean(payload?.cleanPartition),
-      });
+      try {
+        return await loginYouTubeMusicWindow({
+          BrowserWindow,
+          session,
+          parentWindow: getMainWindow(),
+          cleanPartition: payload?.cleanPartition === true,
+        });
+      } catch (error) {
+        return toYtmErrorPayload(error);
+      }
     },
   );
 
@@ -145,16 +208,38 @@ export function registerYtmIpcHandlers(params: RegisterYtmIpcParams): void {
         accountIndex?: number;
       },
     ) => {
-      return await importYtmSessionFallback(payload || { cookieHeader: '' });
+      const safePayload = {
+        cookieHeader:
+          typeof payload?.cookieHeader === 'string' ? payload.cookieHeader : '',
+        visitorData:
+          typeof payload?.visitorData === 'string' ? payload.visitorData : undefined,
+        dataSyncId:
+          typeof payload?.dataSyncId === 'string' ? payload.dataSyncId : undefined,
+        accountIndex:
+          typeof payload?.accountIndex === 'number' ? payload.accountIndex : undefined,
+      };
+      try {
+        return await importYtmSessionFallback(safePayload);
+      } catch (error) {
+        return toYtmErrorPayload(error);
+      }
     },
   );
 
   ipcMain.handle('auth:ytm:switch', async (_ev, accountId: string) => {
-    return await switchYtmAccount(accountId);
+    try {
+      return await switchYtmAccount(accountId);
+    } catch (error) {
+      return toYtmErrorPayload(error);
+    }
   });
 
   ipcMain.handle('auth:ytm:logout', async (_ev, accountId?: string) => {
-    return await logoutYtmAccount({ session, accountId });
+    try {
+      return await logoutYtmAccount({ session, accountId });
+    } catch (error) {
+      return toYtmErrorPayload(error);
+    }
   });
 
   ipcMain.handle('auth:spotify:status', () => getSpotifyStatus());
@@ -175,7 +260,6 @@ export function registerYtmIpcHandlers(params: RegisterYtmIpcParams): void {
   ipcMain.handle(
     'library:sync',
     async (_ev, payload?: { gl?: string; hl?: string }) => {
-      console.log('[YTM Auth] Starting YouTube Music library sync...');
       return await syncYtmLibrary({
         gl: payload?.gl,
         hl: payload?.hl,
@@ -193,7 +277,13 @@ export function registerYtmIpcHandlers(params: RegisterYtmIpcParams): void {
     'library:like',
     async (
       _ev,
-      payload: { videoId: string; liked: boolean; gl?: string; hl?: string },
+      payload: {
+        videoId: string;
+        liked: boolean;
+        gl?: string;
+        hl?: string;
+        expectedAccountId?: string | null;
+      },
     ) => {
       return await setYtmLikeStatus(payload);
     },
@@ -273,7 +363,13 @@ export function registerYtmIpcHandlers(params: RegisterYtmIpcParams): void {
     'queue:lyrics',
     async (
       _ev,
-      payload: { videoId: string; lyricsBrowseId?: string; gl?: string; hl?: string },
+      payload: {
+        videoId: string;
+        lyricsBrowseId?: string;
+        lyricsBrowseVideoId?: string;
+        gl?: string;
+        hl?: string;
+      },
     ) => {
       return await fetchYtmLyrics(payload);
     },

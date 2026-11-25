@@ -59,6 +59,7 @@ export interface YtAuthStatusPayload {
   email: string;
   avatar: string;
   accountIndex: number;
+  activeAccountId?: string | null;
   visitorData: string;
   accounts: YtAccountSummary[];
 }
@@ -161,6 +162,7 @@ export interface YtMusicNextResult {
   currentIndex?: number;
   continuation?: string;
   lyricsBrowseId?: string;
+  sourceVideoId?: string;
   relatedBrowseId?: string;
   endpoint: {
     watchEndpoint: {
@@ -194,6 +196,8 @@ export interface Track {
   thumbnailUrl: string;
   streamUrl: string;
   ytMusicVideoId?: string;
+  /** YouTube Music account that owns this remote track. */
+  ytAccountId?: string;
   genre?: string;
   year?: number;
   explicit?: boolean;
@@ -268,6 +272,15 @@ export interface ArchPlugin {
   addedAt: number;
 }
 
+export type LyricsProviderId = 'lrclib' | 'kugou' | 'youlyplus' | 'simpmusic' | 'ytm';
+
+export interface LyricsProviderInfo {
+  id: LyricsProviderId;
+  name: string;
+  description: string;
+  supportsSynced: boolean;
+}
+
 export interface AppSettings {
   darkMode: DarkModePreference;
   pureBlack: boolean;
@@ -289,6 +302,7 @@ export interface AppSettings {
   translationLanguage: string;
   lyricsFontScale: number;
   lyricsLanguage: 'NATIVE' | 'ENGLISH';
+  lyricsProviders: LyricsProviderId[];
   pauseSearchHistory: boolean;
   pauseListenHistory: boolean;
   ytMusicEnabled: boolean;
